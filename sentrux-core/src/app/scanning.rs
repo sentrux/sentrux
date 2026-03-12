@@ -194,9 +194,10 @@ impl SentruxApp {
                 self.state.record_activity(fe.path.clone(), fe.kind.clone());
             }
             self.state.pending_changes.insert(fe.path);
-            if self.state.pending_since.is_none() {
-                self.state.pending_since = Some(Instant::now());
-            }
+            // Reset debounce timer on every event so rapid changes (e.g. a build)
+            // settle before triggering a rescan, instead of firing 500ms after
+            // the first event while the build is still running.
+            self.state.pending_since = Some(Instant::now());
             had_watch_events = true;
         }
         if had_watch_events {
