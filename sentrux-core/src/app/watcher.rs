@@ -35,34 +35,39 @@ impl Drop for WatcherHandle {
     }
 }
 
-/// Check whether `rel` matches a noise directory (`dir`) that should be skipped.
-/// Matches `dir/...` at start, `.../dir/...` in middle, or exact `dir`.
-/// Zero-allocation: uses byte-level scanning only.
-fn is_noise_dir(rel: &str, dir: &str) -> bool {
-    // "dir/..." at start
-    (rel.starts_with(dir) && rel.as_bytes().get(dir.len()) == Some(&b'/'))
-    // ".../dir/..." in middle OR ".../dir" at end — scan for /dir without allocation
-    || {
-        let dir_bytes = dir.as_bytes();
-        let rel_bytes = rel.as_bytes();
-        // Check for "/dir/" in middle
-        let needle_len = dir_bytes.len() + 2; // "/dir/"
-        let has_middle = rel_bytes.len() >= needle_len && rel_bytes.windows(needle_len).any(|w| {
-            w[0] == b'/' && w[w.len() - 1] == b'/' && &w[1..w.len() - 1] == dir_bytes
-        });
-        // Check for "/dir" at end (e.g., "vendor/.git")
-        let has_end = rel_bytes.len() > dir_bytes.len()
-            && rel.ends_with(dir)
-            && rel_bytes[rel_bytes.len() - dir_bytes.len() - 1] == b'/';
-        has_middle || has_end
+/// Return true if the path should be filtered out based on hardcoded ignore lists.
+/// Checks every segment of the relative path against the scanner's IGNORED_DIRS,
+/// which is the canonical list shared with the scanner itself.
+fn should_skip_path_hardcoded(rel: &str) -> bool {
+    use crate::analysis::scanner::common::should_ignore_dir;
+    for segment in rel.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if should_ignore_dir(segment) {
+            return true;
+        }
     }
-    // exact match
-    || rel == dir
+    false
 }
 
-/// Return true if the path should be filtered out as noise.
-fn should_skip_path(rel: &str) -> bool {
-    is_noise_dir(rel, ".git") || is_noise_dir(rel, "node_modules") || is_noise_dir(rel, "target")
+/// Build a gitignore matcher from the project's .gitignore and .git/info/exclude.
+/// Falls back to an empty matcher if no gitignore files exist or parsing fails.
+fn build_gitignore(root: &Path) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    if let Some(err) = builder.add(root.join(".gitignore")) {
+        eprintln!("[watcher] .gitignore parse warning: {}", err);
+    }
+    if let Some(err) = builder.add(root.join(".git/info/exclude")) {
+        eprintln!("[watcher] .git/info/exclude parse warning: {}", err);
+    }
+    match builder.build() {
+        Ok(gi) => gi,
+        Err(e) => {
+            eprintln!("[watcher] gitignore build error: {}, using empty matcher", e);
+            ignore::gitignore::GitignoreBuilder::new(root).build().unwrap()
+        }
+    }
 }
 
 /// Map a `notify::EventKind` to a static event kind string.
@@ -176,12 +181,19 @@ fn send_event(tx: &Sender<FileEvent>, fe: FileEvent, rel: &str) -> bool {
 ///
 /// Uses manual debounce via a background drain thread to avoid
 /// depending on notify-debouncer-mini's specific API shape.
+///
+/// Filters events against .gitignore (parsed at startup) and the scanner's
+/// IGNORED_DIRS list to prevent gitignored paths (e.g. .gradle-home with an
+/// active daemon) from triggering infinite rescan loops.
 pub fn start_watcher(
     root: &str,
     tx: Sender<FileEvent>,
     debounce_ms: u64,
 ) -> Result<WatcherHandle, notify::Error> {
     let root_path = PathBuf::from(root);
+
+    // Build gitignore matcher once — used in the callback to filter ignored paths
+    let gitignore = build_gitignore(&root_path);
 
     // Pending events keyed by relative path, value = (last event time, is_dir, event kind)
     type PendingMap = HashMap<String, (Instant, bool, &'static str)>;
@@ -207,10 +219,24 @@ pub fn start_watcher(
             for path in &event.paths {
                 if let Ok(rel) = path.strip_prefix(&root_for_cb) {
                     let rel_str = rel.to_string_lossy().to_string();
-                    if rel_str.is_empty() || should_skip_path(&rel_str) {
+                    if rel_str.is_empty() || should_skip_path_hardcoded(&rel_str) {
                         continue;
                     }
                     let is_dir = is_dir_event(event.kind, path);
+                    // Skip non-create/remove events on directories — modify and
+                    // access events on dirs are noise from inotify watch setup
+                    // and metadata changes (especially on CoW filesystems like
+                    // btrfs). We get separate events for actual file changes.
+                    if is_dir && !matches!(event.kind,
+                        notify::EventKind::Create(_) | notify::EventKind::Remove(_))
+                    {
+                        continue;
+                    }
+                    // Check .gitignore — matched_path_or_any_parents also covers
+                    // files inside gitignored directories (e.g. .gradle-home/*)
+                    if gitignore.matched_path_or_any_parents(&rel_str, is_dir).is_ignore() {
+                        continue;
+                    }
                     insert_pending(&pending_w, rel_str, is_dir, kind_str);
                 }
             }
