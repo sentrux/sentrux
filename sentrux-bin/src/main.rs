@@ -536,6 +536,24 @@ capabilities = ["functions", "classes", "imports"]
             .with_inner_size([1280.0, 800.0])
             .with_title(if sentrux_core::license::current_tier() >= sentrux_core::license::Tier::Pro { "Sentrux Pro" } else { "sentrux" }),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
+                instance_descriptor: eframe::wgpu::InstanceDescriptor {
+                    // Vulkan surface creation via EGL/DRI3 is unreliable on many
+                    // Linux setups; default to GL (still hardware-accelerated).
+                    // Override with WGPU_BACKEND=vulkan if desired.
+                    backends: eframe::wgpu::Backends::from_env()
+                        .unwrap_or(if cfg!(target_os = "linux") {
+                            eframe::wgpu::Backends::GL
+                        } else {
+                            eframe::wgpu::Backends::PRIMARY | eframe::wgpu::Backends::GL
+                        }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
