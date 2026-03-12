@@ -13,7 +13,7 @@ categories = ["development-tools", "visualization"]
 eframe = { workspace = true }
 serde_json = "1"
 egui = { workspace = true }
-rfd = "0.15"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 crossbeam-channel = "0.5"
 rayon = "1"
 ignore = "0.4"
