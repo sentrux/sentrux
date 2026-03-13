@@ -28,7 +28,21 @@ pub(crate) fn group_files_by_parent(files: Vec<FileNode>) -> (HashMap<String, Ve
 }
 
 /// Expand all ancestor directory paths so every intermediate dir is present.
+///
+/// `all_dirs_set` starts with only the direct parent dirs of files (from
+/// `group_files_by_parent`). This function walks up from each file path
+/// to ensure ALL intermediate ancestor directories are added.
+///
+/// We track which dirs have been fully expanded (ancestors walked) separately
+/// from which dirs exist in the set — a dir can be in `all_dirs_set` because
+/// it's a direct parent of a file, but its own ancestors may not have been
+/// added yet. Breaking early on set membership caused subtrees to become
+/// orphaned when a leaf parent dir was already in the set but its ancestors
+/// were not.
 pub(crate) fn expand_ancestor_dirs(file_children: &HashMap<String, Vec<FileNode>>, all_dirs_set: &mut HashSet<String>) {
+    // Track dirs whose ancestors have been fully walked to the root.
+    let mut expanded: HashSet<String> = HashSet::new();
+
     let file_paths: Vec<String> = file_children.values()
         .flat_map(|v| v.iter().map(|f| f.path.clone()))
         .collect();
@@ -40,7 +54,10 @@ pub(crate) fn expand_ancestor_dirs(file_children: &HashMap<String, Vec<FileNode>
                 all_dirs_set.insert(s);
                 break;
             }
-            if !all_dirs_set.insert(s.clone()) {
+            all_dirs_set.insert(s.clone());
+            // Safe to break only if this dir was previously fully expanded
+            // (meaning all its ancestors are guaranteed to be in the set).
+            if !expanded.insert(s) {
                 break;
             }
             p = parent;
@@ -112,6 +129,7 @@ pub(crate) fn assemble_dir_node(
 /// Uses parent→children map for O(D) directory traversal instead of O(D²).
 /// Consumes the Vec to avoid cloning each FileNode. [ref:93cf32d4]
 pub(crate) fn build_tree(files: Vec<FileNode>, root_name: &str) -> (FileNode, u32) {
+    let file_count = files.len();
     let (mut file_children, mut all_dirs_set) = group_files_by_parent(files);
     expand_ancestor_dirs(&file_children, &mut all_dirs_set);
     let dir_children = build_dir_children_map(&all_dirs_set);
@@ -119,5 +137,55 @@ pub(crate) fn build_tree(files: Vec<FileNode>, root_name: &str) -> (FileNode, u3
 
     let mut root = assemble_dir_node("", &mut file_children, &dir_children);
     root.name = root_name.to_string();
+
+    // Safety check: all files must be consumed into the tree.
+    let orphaned: usize = file_children.values().map(|v| v.len()).sum();
+    if orphaned > 0 {
+        eprintln!("[tree] BUG: {} of {} files orphaned (not reachable from root)", orphaned, file_count);
+        let sample: Vec<&str> = file_children.values()
+            .flat_map(|v| v.iter().map(|f| f.path.as_str()))
+            .take(5)
+            .collect();
+        eprintln!("[tree] orphaned sample: {:?}", sample);
+    }
+
     (root, total_dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::FileNode;
+
+    fn test_file(path: &str) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            is_dir: false, lines: 10, logic: 8, comments: 1, blanks: 1,
+            funcs: 0, mtime: 0.0, gs: String::new(), lang: "go".into(),
+            sa: None, children: None,
+        }
+    }
+
+    #[test]
+    fn deep_nested_files_not_orphaned() {
+        // Regression test: files in deep subdirectories must not be lost
+        // when their parent dir was already in the initial dir set but
+        // had no ancestors expanded yet.
+        let files = vec![
+            test_file("server/go.mod"),        // parent = "server" (in initial set)
+            test_file("server/internal/handler/handler.go"),
+            test_file("server/internal/config/config.go"),
+            test_file("scripts/test.sh"),
+            test_file("README.md"),
+        ];
+
+        let (tree, _) = build_tree(files, "root");
+        let flat = crate::core::snapshot::flatten_files_ref(&tree);
+        assert_eq!(flat.len(), 5, "All 5 files must survive tree building, got {}", flat.len());
+
+        let paths: Vec<&str> = flat.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"server/internal/handler/handler.go"));
+        assert!(paths.contains(&"server/internal/config/config.go"));
+    }
 }
