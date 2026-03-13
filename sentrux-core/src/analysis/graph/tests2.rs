@@ -425,4 +425,92 @@ mod tests {
         assert!(gr.import_edges.iter().any(|e| e.from_file == "main.py" && e.to_file == "mylib/utils/helpers.py"),
             "expected main.py->helpers.py edge, got {:?}", gr.import_edges);
     }
+
+    #[test]
+    fn go_package_imports_resolve_to_directory() {
+        // Go imports reference packages (directories), not files.
+        // "internal/config" should resolve to a .go file inside internal/config/.
+        let tmp = std::env::temp_dir().join("sentrux_test_go_pkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("internal/config")).unwrap();
+        std::fs::create_dir_all(tmp.join("internal/handler")).unwrap();
+        std::fs::write(tmp.join("go.mod"), "module github.com/slush-dev/phonevault\n\ngo 1.21\n").unwrap();
+
+        let files = vec![
+            make_file("main.go", "cmd/server/main.go", "go",
+                Some(StructuralAnalysis {
+                    functions: None, cls: None, co: None, tags: None,
+                    imp: Some(vec![
+                        "github.com/slush-dev/phonevault/internal/config".to_string(),
+                        "github.com/slush-dev/phonevault/internal/handler".to_string(),
+                    ]),
+                }),
+            ),
+            make_file("config.go", "internal/config/config.go", "go", None),
+            make_file("defaults.go", "internal/config/defaults.go", "go", None),
+            make_file("handler.go", "internal/handler/handler.go", "go", None),
+        ];
+
+        let refs: Vec<&FileNode> = files.iter().collect();
+        let gr = build_graphs(&refs, Some(&tmp), 5);
+
+        let main_edges: Vec<&ImportEdge> = gr.import_edges.iter()
+            .filter(|e| e.from_file == "cmd/server/main.go").collect();
+        let targets: std::collections::HashSet<&str> = main_edges.iter()
+            .map(|e| e.to_file.as_str()).collect();
+
+        assert!(targets.iter().any(|t| t.starts_with("internal/config/")),
+            "expected edge to internal/config/*.go, got targets: {:?}", targets);
+        assert!(targets.iter().any(|t| t.starts_with("internal/handler/")),
+            "expected edge to internal/handler/*.go, got targets: {:?}", targets);
+        assert!(main_edges.len() >= 2,
+            "expected at least 2 import edges, got {}: {:?}", main_edges.len(), main_edges);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_nested_module_imports_resolve() {
+        // Go project nested under a subdirectory (e.g. monorepo with server/go.mod).
+        // Module-qualified imports like "github.com/user/repo/internal/config"
+        // must resolve even when go.mod is not at the scan root.
+        let tmp = std::env::temp_dir().join("sentrux_test_go_nested_mod");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("server/cmd/server")).unwrap();
+        std::fs::create_dir_all(tmp.join("server/internal/config")).unwrap();
+        std::fs::create_dir_all(tmp.join("server/internal/handler")).unwrap();
+        std::fs::write(tmp.join("server/go.mod"),
+            "module github.com/example/myapp\n\ngo 1.21\n").unwrap();
+
+        let files = vec![
+            make_file("main.go", "server/cmd/server/main.go", "go",
+                Some(StructuralAnalysis {
+                    functions: None, cls: None, co: None, tags: None,
+                    imp: Some(vec![
+                        "github.com/example/myapp/internal/config".to_string(),
+                        "github.com/example/myapp/internal/handler".to_string(),
+                    ]),
+                }),
+            ),
+            make_file("config.go", "server/internal/config/config.go", "go", None),
+            make_file("handler.go", "server/internal/handler/handler.go", "go", None),
+        ];
+
+        let refs: Vec<&FileNode> = files.iter().collect();
+        let gr = build_graphs(&refs, Some(&tmp), 5);
+
+        let main_edges: Vec<&ImportEdge> = gr.import_edges.iter()
+            .filter(|e| e.from_file == "server/cmd/server/main.go").collect();
+        let targets: std::collections::HashSet<&str> = main_edges.iter()
+            .map(|e| e.to_file.as_str()).collect();
+
+        assert!(targets.iter().any(|t| t.starts_with("server/internal/config/")),
+            "expected edge to server/internal/config/*.go, got targets: {:?}", targets);
+        assert!(targets.iter().any(|t| t.starts_with("server/internal/handler/")),
+            "expected edge to server/internal/handler/*.go, got targets: {:?}", targets);
+        assert!(main_edges.len() >= 2,
+            "expected at least 2 import edges, got {}: {:?}", main_edges.len(), main_edges);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

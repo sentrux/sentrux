@@ -110,29 +110,29 @@ pub(super) fn extract_rust(text: &str) -> Vec<String> {
 }
 
 pub(super) fn extract_go(text: &str) -> Vec<String> {
-    let rest = text.trim().strip_prefix("import").unwrap_or(text.trim());
-    rest.replace(['(', ')'], "")
-        .split_whitespace()
-        .map(|s| s.trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-        // Filter out Go import aliases (bare identifiers without `/` or `.`).
-        // e.g., `import m "github.com/foo/bar"` emitted both `m` and the path.
-        // Real Go module paths always contain `/` or `.` (except stdlib single-word
-        // packages like "fmt"). Keep single-word tokens only if they look like
-        // stdlib (all lowercase, no underscore prefix).
-        .filter(|s| {
-            if s.contains('/') || s.contains('.') {
-                return true; // definitely a module path
+    // Go import paths are always double-quoted strings inside import declarations.
+    // Aliases (`_`, `.`, named) are unquoted identifiers that precede the path.
+    // By extracting only quoted strings we correctly skip all aliases without
+    // heuristics that confuse aliases like `cfg` with stdlib packages.
+    let mut results = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1; // skip opening quote
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
             }
-            // Single word: reject known aliases `_` and `.`, and any token that
-            // starts with uppercase (convention for named aliases)
-            if s == "_" || s == "." {
-                return false;
+            if i > start {
+                results.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
             }
-            // Keep lowercase single-word tokens (stdlib: "fmt", "os", "net", etc.)
-            s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        })
-        .collect()
+            i += 1; // skip closing quote
+        } else {
+            i += 1;
+        }
+    }
+    results
 }
 
 pub(super) fn extract_c_cpp(text: &str) -> Vec<String> {

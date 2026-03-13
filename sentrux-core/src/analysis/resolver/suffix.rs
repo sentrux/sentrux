@@ -114,7 +114,7 @@ pub(crate) fn resolve_path_imports_ref(files: &[&FileNode], scan_root: Option<&P
     let t_oxc = t0.elapsed();
 
     // Tier 2: suffix-index resolution for non-JS/TS languages
-    let suffix_index = build_module_suffix_index(&known_files, scan_root);
+    let suffix_index = build_module_suffix_index(&known_files, scan_root, &project_map);
     let t_suffix = t0.elapsed();
     let tier2_edges = resolve_tier2_imports(files, &known_files, &project_map, &suffix_index, &exts);
     edges.extend(tier2_edges);
@@ -310,13 +310,29 @@ fn build_project_map(files: &[&FileNode], scan_root: &Path) -> HashMap<String, S
     project_map
 }
 
+/// Add all suffixes of a module path to the index, pointing to the given file.
+/// e.g. "a/b/c" generates suffixes ["a/b/c", "b/c", "c"].
+fn add_module_suffixes<'a>(index: &mut HashMap<String, Vec<&'a str>>, module_path: &str, file_path: &'a str) {
+    let mut pos = 0;
+    loop {
+        let suffix = &module_path[pos..];
+        if !suffix.is_empty() {
+            index.entry(suffix.to_string()).or_default().push(file_path);
+        }
+        match module_path[pos..].find('/') {
+            Some(slash) => pos += slash + 1,
+            None => break,
+        }
+    }
+}
+
 /// Map every suffix of every file's module path to that file.
 /// e.g. "a/b/c.py" -> suffixes ["c", "b/c", "a/b/c"] all point to "a/b/c.py".
 ///
 /// Package index files use their parent directory as the module path:
 ///   __init__.py, mod.rs, index.js, index.ts, etc.
 /// This is detected from the filename -- no language knowledge needed.
-fn build_module_suffix_index<'a>(known_files: &HashSet<&'a str>, scan_root: &Path) -> SuffixIndex<'a> {
+fn build_module_suffix_index<'a>(known_files: &HashSet<&'a str>, scan_root: &Path, project_map: &HashMap<String, String>) -> SuffixIndex<'a> {
     let mut index: HashMap<String, Vec<&'a str>> = HashMap::new();
     for &file_path in known_files {
         let module_path = file_to_module_path(file_path);
@@ -324,16 +340,18 @@ fn build_module_suffix_index<'a>(known_files: &HashSet<&'a str>, scan_root: &Pat
             continue;
         }
 
-        // Generate all suffixes: "a/b/c" -> ["c", "b/c", "a/b/c"]
-        let mut pos = 0;
-        loop {
-            let suffix = &module_path[pos..];
-            if !suffix.is_empty() {
-                index.entry(suffix.to_string()).or_default().push(file_path);
-            }
-            match module_path[pos..].find('/') {
-                Some(slash) => pos += slash + 1,
-                None => break,
+        add_module_suffixes(&mut index, module_path, file_path);
+
+        // Go imports reference packages (directories), not individual files.
+        // e.g. `import "internal/config"` means the package in internal/config/.
+        // Unlike Python (__init__.py) or Rust (mod.rs), Go has no package index
+        // file — any .go file in a directory is part of the package.
+        // Add parent-directory suffixes so Go package imports can resolve.
+        if file_path.ends_with(".go") {
+            if let Some((parent, _)) = module_path.rsplit_once('/') {
+                if !parent.is_empty() {
+                    add_module_suffixes(&mut index, parent, file_path);
+                }
             }
         }
     }
@@ -342,7 +360,50 @@ fn build_module_suffix_index<'a>(known_files: &HashSet<&'a str>, scan_root: &Pat
     let mut manifest_aliases: HashMap<String, Vec<&'a str>> = HashMap::new();
     inject_manifest_aliases(&mut manifest_aliases, known_files, scan_root);
 
-    SuffixIndex { index, manifest_aliases }
+    // Go module prefixes: parse go.mod files to map module paths to project dirs.
+    let go_module_prefixes = collect_go_module_prefixes(project_map, scan_root);
+
+    SuffixIndex { index, manifest_aliases, go_module_prefixes }
+}
+
+/// Extract the module path from a go.mod file content.
+/// Parses `module github.com/user/repo` from the first `module` directive.
+fn extract_go_module_name(content: &str) -> Option<&str> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("module") {
+            let rest = rest.trim();
+            if rest.is_empty() { continue; }
+            // Module path is the first token (no quotes in go.mod)
+            return Some(rest.split_whitespace().next().unwrap_or(rest));
+        }
+    }
+    None
+}
+
+/// Scan project roots for go.mod files and build a map of Go module paths to project directories.
+/// Uses the project_map to find unique project roots, then checks each for go.mod.
+/// Sorted longest-first so more specific module paths match before shorter ones.
+fn collect_go_module_prefixes(project_map: &HashMap<String, String>, scan_root: &Path) -> Vec<(String, String)> {
+    let unique_roots: HashSet<&str> = project_map.values().map(|s| s.as_str()).collect();
+    let mut prefixes = Vec::new();
+
+    for &project_dir in &unique_roots {
+        let go_mod_path = if project_dir.is_empty() {
+            scan_root.join("go.mod")
+        } else {
+            scan_root.join(project_dir).join("go.mod")
+        };
+
+        if let Ok(content) = std::fs::read_to_string(&go_mod_path) {
+            if let Some(module_name) = extract_go_module_name(&content) {
+                prefixes.push((module_name.to_string(), project_dir.to_string()));
+            }
+        }
+    }
+    // Sort longest module path first for greedy matching
+    prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    prefixes
 }
 
 /// Derive the project directory from a lib.rs file path.

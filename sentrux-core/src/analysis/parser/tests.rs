@@ -225,6 +225,60 @@ func main() {
     }
 
     #[test]
+    fn go_grouped_imports_extracted() {
+        let code = br#"
+package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+
+    "github.com/slush-dev/phonevault/internal/config"
+    "github.com/slush-dev/phonevault/internal/handler"
+)
+
+func main() {}
+"#;
+        let sa = parse_bytes(code, "go").expect("go parse failed");
+        let imports = sa.imp.expect("expected imports");
+        assert!(imports.contains(&"context".to_string()), "missing context, got {:?}", imports);
+        assert!(imports.contains(&"fmt".to_string()), "missing fmt, got {:?}", imports);
+        assert!(imports.contains(&"net/http".to_string()), "missing net/http, got {:?}", imports);
+        assert!(imports.contains(&"github.com/slush-dev/phonevault/internal/config".to_string()),
+            "missing internal/config, got {:?}", imports);
+        assert!(imports.contains(&"github.com/slush-dev/phonevault/internal/handler".to_string()),
+            "missing internal/handler, got {:?}", imports);
+        assert_eq!(imports.len(), 5, "expected 5 imports, got {:?}", imports);
+    }
+
+    #[test]
+    fn go_aliased_imports_only_extract_paths() {
+        let code = br#"
+package main
+
+import (
+    "fmt"
+    cfg "github.com/slush-dev/phonevault/internal/config"
+    _ "github.com/lib/pq"
+    . "github.com/onsi/gomega"
+)
+
+func main() {}
+"#;
+        let sa = parse_bytes(code, "go").expect("go parse failed");
+        let imports = sa.imp.expect("expected imports");
+        // Only quoted paths should be extracted — aliases (cfg, _, .) are skipped
+        assert!(imports.contains(&"fmt".to_string()), "missing fmt");
+        assert!(imports.contains(&"github.com/slush-dev/phonevault/internal/config".to_string()),
+            "missing config path");
+        assert!(imports.contains(&"github.com/lib/pq".to_string()), "missing pq");
+        assert!(imports.contains(&"github.com/onsi/gomega".to_string()), "missing gomega");
+        assert!(!imports.iter().any(|i| i == "cfg"), "alias 'cfg' should not be in imports");
+        assert_eq!(imports.len(), 4, "expected 4 imports, got {:?}", imports);
+    }
+
+    #[test]
     fn oracle_java() {
         let code = br#"
 import java.util.List;
