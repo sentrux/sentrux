@@ -591,19 +591,27 @@ capabilities = ["functions", "classes", "imports"]
         };
 
         let path_clone = initial_path.clone();
-        let result = eframe::run_native(
-            "Sentrux",
-            options,
-            Box::new(move |cc| Ok(Box::new(app::SentruxApp::new(cc, path_clone)))),
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eframe::run_native(
+                "Sentrux",
+                options,
+                Box::new(move |cc| Ok(Box::new(app::SentruxApp::new(cc, path_clone)))),
+            )
+        }));
 
         match result {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                eprintln!("[gpu] backend {:?} failed: {}", backends, e);
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => {
+                eprintln!("[gpu] backend {:?} failed: {e}", backends);
+                eprintln!("[gpu] hint: try setting WGPU_BACKEND=vulkan or WGPU_BACKEND=gl");
                 if i + 1 == backend_attempts.len() {
-                    eprintln!("[gpu] all backends exhausted — try setting WGPU_BACKEND=gl or WGPU_BACKEND=vulkan");
                     return Err(e);
+                }
+            }
+            Err(_) => {
+                eprintln!("[gpu] hint: try setting WGPU_BACKEND=vulkan or WGPU_BACKEND=gl");
+                if i + 1 == backend_attempts.len() {
+                    std::process::exit(1);
                 }
             }
         }
