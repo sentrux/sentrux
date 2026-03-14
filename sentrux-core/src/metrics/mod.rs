@@ -325,11 +325,44 @@ fn build_call_target_set(files: &[&FileNode]) -> HashSet<String> {
 /// Implicit entry points: lifecycle, trait, framework, and common patterns.
 fn implicit_entry_points() -> HashSet<&'static str> {
     [
+        // Core Rust traits and standard entry points
         "main", "new", "default", "from", "into", "try_from", "try_into",
         "drop", "fmt", "clone", "eq", "hash", "cmp", "partial_cmp",
         "serialize", "deserialize", "as_ref", "deref", "index",
+
+        // Common lifecycle / framework hooks
         "init", "setup", "teardown", "run", "start", "stop", "build",
         "configure", "register", "update", "draw", "render",
+
+        // Common lifecycle: shutdown, cleanup, teardown variants
+        "dispose", "destroy", "close", "shutdown", "cleanup",
+        "reset", "refresh", "connect", "disconnect",
+
+        // Database migrations (Knex, Sequelize, Prisma)
+        "up", "down", "seed",
+
+        // Python CLI frameworks (Click, Typer, argparse)
+        "cli",
+
+        // MCP / plugin protocol methods
+        "list_tools", "call_tool", "list_resources", "list_prompts",
+
+        // Swift / iOS view and application lifecycle
+        "application", "awakeFromNib",
+        "viewDidLoad", "viewWillAppear", "viewDidAppear",
+        "viewWillDisappear", "viewDidDisappear",
+        "didReceiveMemoryWarning",
+
+        // Flutter plugin protocol
+        "handle",
+
+        // Python dunder / property-like methods
+        "__init__", "__str__", "__repr__", "__len__",
+        "__iter__", "__next__", "__enter__", "__exit__",
+        "__call__", "__getitem__", "__setitem__",
+
+        // Web framework handlers
+        "middleware", "handler", "callback",
     ].iter().copied().collect()
 }
 
@@ -353,9 +386,22 @@ fn is_dead_code_skip_file(file: &FileNode) -> bool {
 
 /// Check if a function should be excluded from dead-code detection.
 fn is_excluded_function(func_name: &str, implicit: &HashSet<&str>) -> bool {
-    // Skip test/bench functions
-    if func_name.starts_with("test_") || func_name.starts_with("bench_") {
+    // Skip test/bench functions.
+    // "test_" covers Rust snake_case tests; "bench_" covers Rust benchmarks.
+    // The second test arm covers Swift XCTest convention (testExample, testPerformance, …)
+    // by requiring the character after "test" to be an ASCII uppercase letter or '_',
+    // which avoids false matches on names like "testability" or "testing".
+    if func_name.starts_with("bench_") {
         return true;
+    }
+    if func_name.starts_with("test_") {
+        return true;
+    }
+    if func_name.len() > 4 && func_name.starts_with("test") {
+        let next = func_name.as_bytes()[4];
+        if next == b'_' || next.is_ascii_uppercase() {
+            return true;
+        }
     }
     // Skip trait impl methods (Foo::bar pattern)
     if func_name.contains("::") {
