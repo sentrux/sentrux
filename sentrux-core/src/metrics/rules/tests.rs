@@ -139,7 +139,7 @@ max_cycles = 0
 
         let edges = vec![edge("a.rs", "b.rs"), edge("b.rs", "a.rs")];
         let snap = make_snapshot(edges.clone(), vec![file("a.rs"), file("b.rs")]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -156,7 +156,7 @@ max_cycles = 5
 
         let edges = vec![edge("a.rs", "b.rs")];
         let snap = make_snapshot(edges.clone(), vec![file("a.rs"), file("b.rs")]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -185,7 +185,7 @@ order = 2
             file("src/scanner.rs"),
             file("src/ui/panel.rs"),
         ]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -213,7 +213,7 @@ order = 2
             file("src/ui/panel.rs"),
             file("src/scanner.rs"),
         ]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -239,7 +239,7 @@ reason = "Renderer must not know about scanning"
             file("src/renderer/edges.rs"),
             file("src/scanner.rs"),
         ]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -263,7 +263,7 @@ to = "src/scanner.rs"
             file("src/app.rs"),
             file("src/scanner.rs"),
         ]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);
@@ -280,7 +280,7 @@ to = "src/scanner.rs"
         let config: RulesConfig = toml::from_str("[constraints]").unwrap();
         let edges = vec![edge("a.rs", "b.rs"), edge("b.rs", "a.rs")];
         let snap = make_snapshot(edges.clone(), vec![file("a.rs"), file("b.rs")]);
-        let health = metrics::compute_health(&snap);
+        let health = metrics::compute_health(&snap, None);
         let arch_report = arch::compute_arch(&snap);
 
         let result = check_rules(&config, &health, &arch_report, &edges);

@@ -22,13 +22,30 @@ use std::collections::{HashMap, HashSet};
 /// ("src") and importing from "src/layout" IS cross-module, which is
 /// factually correct. Entry-point exclusion already handles main.rs for
 /// god-file detection separately.
+#[allow(dead_code)] // Used by test modules (conditionally compiled)
 pub(crate) fn is_same_module(path_a: &str, path_b: &str) -> bool {
     crate::core::path_utils::module_of(path_a) == crate::core::path_utils::module_of(path_b)
 }
 
 /// Re-export module_of from core::path_utils for backward compatibility.
+/// Used by test modules for path-based assertions.
+#[allow(dead_code)] // Used by test modules (conditionally compiled)
 pub(crate) fn module_of(path: &str) -> &str {
     crate::core::path_utils::module_of(path)
+}
+
+/// Depth-aware module extraction. Uses `module_of_at_depth` when depth is
+/// provided, falling back to the default `module_of` (depth-3) otherwise.
+pub(crate) fn module_of_depth<'a>(path: &'a str, depth: Option<usize>) -> &'a str {
+    match depth {
+        Some(d) => crate::core::path_utils::module_of_at_depth(path, d),
+        None => crate::core::path_utils::module_of(path),
+    }
+}
+
+/// Depth-aware same-module check.
+pub(crate) fn is_same_module_depth(path_a: &str, path_b: &str, depth: Option<usize>) -> bool {
+    module_of_depth(path_a, depth) == module_of_depth(path_b, depth)
 }
 
 /// Coupling score: ratio of import edges that cross module boundaries,
@@ -40,7 +57,7 @@ pub(crate) fn module_of(path: &str) -> &str {
 ///
 /// 0.0 = all imports within same module or to stable foundations.
 /// 1.0 = all imports cross modules toward unstable targets (spaghetti).
-pub(crate) fn compute_coupling_score(edges: &[ImportEdge], stable_modules: &HashSet<&str>) -> (f64, usize, usize) {
+pub(crate) fn compute_coupling_score(edges: &[ImportEdge], stable_modules: &HashSet<&str>, module_depth: Option<usize>) -> (f64, usize, usize) {
     if edges.is_empty() {
         return (0.0, 0, 0);
     }
@@ -48,9 +65,9 @@ pub(crate) fn compute_coupling_score(edges: &[ImportEdge], stable_modules: &Hash
     let mut cross = 0usize;
     let mut cross_unstable = 0usize;
     for edge in edges {
-        if !is_same_module(&edge.from_file, &edge.to_file) {
+        if !is_same_module_depth(&edge.from_file, &edge.to_file, module_depth) {
             cross += 1;
-            let to_mod = module_of(&edge.to_file);
+            let to_mod = module_of_depth(&edge.to_file, module_depth);
             if !stable_modules.contains(to_mod) {
                 cross_unstable += 1;
             }
@@ -101,7 +118,7 @@ fn is_module_stable(
 /// The fan-in floor prevents leaf nodes in small graphs from being falsely
 /// classified as "foundations." A module with fan-in=1 is just a leaf, not
 /// a foundational type file that everything depends on.
-pub(crate) fn compute_stable_modules(edges: &[ImportEdge]) -> HashSet<&str> {
+pub(crate) fn compute_stable_modules<'a>(edges: &'a [ImportEdge], module_depth: Option<usize>) -> HashSet<&'a str> {
     const STABILITY_THRESHOLD: f64 = 0.15;
     const MIN_FAN_IN: usize = 3;
 
@@ -110,8 +127,8 @@ pub(crate) fn compute_stable_modules(edges: &[ImportEdge]) -> HashSet<&str> {
     let mut mod_fan_in: HashMap<&str, HashSet<&str>> = HashMap::new();
 
     for edge in edges {
-        let from_mod = module_of(&edge.from_file);
-        let to_mod = module_of(&edge.to_file);
+        let from_mod = module_of_depth(&edge.from_file, module_depth);
+        let to_mod = module_of_depth(&edge.to_file, module_depth);
         if from_mod != to_mod {
             mod_fan_out.entry(from_mod).or_default().insert(to_mod);
             mod_fan_in.entry(to_mod).or_default().insert(from_mod);
@@ -160,7 +177,7 @@ pub(crate) fn compute_stable_modules(edges: &[ImportEdge]) -> HashSet<&str> {
 /// modules (types, error, config) are healthy hub-and-spoke dependencies
 /// and should not inflate entropy. Without this, a project with shared
 /// foundational types always scores entropy ≈ 1.0 (F grade).
-pub(crate) fn compute_shannon_entropy(edges: &[ImportEdge], stable_modules: &HashSet<&str>) -> (f64, f64, usize) {
+pub(crate) fn compute_shannon_entropy(edges: &[ImportEdge], stable_modules: &HashSet<&str>, module_depth: Option<usize>) -> (f64, f64, usize) {
     if edges.is_empty() {
         return (0.0, 0.0, 0);
     }
@@ -169,9 +186,9 @@ pub(crate) fn compute_shannon_entropy(edges: &[ImportEdge], stable_modules: &Has
     let mut pair_counts: HashMap<(&str, &str), usize> = HashMap::new();
     let mut cross_count: usize = 0;
     for edge in edges {
-        if !is_same_module(&edge.from_file, &edge.to_file) {
-            let from_mod = module_of(&edge.from_file);
-            let to_mod = module_of(&edge.to_file);
+        if !is_same_module_depth(&edge.from_file, &edge.to_file, module_depth) {
+            let from_mod = module_of_depth(&edge.from_file, module_depth);
+            let to_mod = module_of_depth(&edge.to_file, module_depth);
             // Skip edges to stable foundations
             if stable_modules.contains(to_mod) {
                 continue;
@@ -219,7 +236,7 @@ pub(crate) fn compute_shannon_entropy(edges: &[ImportEdge], stable_modules: &Has
 /// code never imports from test files. This is the same principle as excluding
 /// entry points from god-file detection: known one-way consumers should not
 /// penalize the metric they can't contribute to.
-pub(crate) fn compute_avg_cohesion(edges: &[ImportEdge], files: &[&crate::core::types::FileNode]) -> Option<f64> {
+pub(crate) fn compute_avg_cohesion(edges: &[ImportEdge], files: &[&crate::core::types::FileNode], module_depth: Option<usize>) -> Option<f64> {
     // Group files by module (same boundary as coupling), excluding test files.
     // Test files are one-way consumers (import production code, never imported back).
     // Including them inflates n without proportional intra-module edges,
@@ -232,17 +249,17 @@ pub(crate) fn compute_avg_cohesion(edges: &[ImportEdge], files: &[&crate::core::
         if testgap::is_test_file(&f.path) {
             continue;
         }
-        let m = module_of(&f.path);
+        let m = module_of_depth(&f.path, module_depth);
         mod_files.entry(m).or_default().push(f.path.as_str());
     }
 
     // Count intra-module edges per module.
-    // is_same_module is strict equality of module_of(), so both endpoints
+    // is_same_module_depth is strict equality of module_of_depth(), so both endpoints
     // always map to the same module key — attribute to that module.
     let mut mod_edge_count: HashMap<&str, usize> = HashMap::new();
     for edge in edges {
-        if is_same_module(&edge.from_file, &edge.to_file) {
-            let m = module_of(&edge.from_file);
+        if is_same_module_depth(&edge.from_file, &edge.to_file, module_depth) {
+            let m = module_of_depth(&edge.from_file, module_depth);
             *mod_edge_count.entry(m).or_default() += 1;
         }
     }

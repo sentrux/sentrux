@@ -76,7 +76,7 @@ impl SentruxApp {
         reports: crate::app::channels::ScanReports,
         ctx: &egui::Context,
     ) {
-        let report = reports.health.unwrap_or_else(|| crate::metrics::compute_health(&snap));
+        let report = reports.health.unwrap_or_else(|| crate::metrics::compute_health(&snap, None));
         let arch = reports.arch.unwrap_or_else(|| crate::metrics::arch::compute_arch(&snap));
         self.check_arch_degradation(&arch);
         // Record scan for telemetry

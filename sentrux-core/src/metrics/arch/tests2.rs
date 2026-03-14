@@ -174,7 +174,7 @@ fn distance_pure_interface_module() {
         edge(impl_file, api_file),
     ];
     let snap = make_snapshot_with_files(edges.clone(), files);
-    let results = compute_distance_from_main_seq(&snap, &edges);
+    let results = compute_distance_from_main_seq(&snap, &edges, None);
     let api = results.iter().find(|m| m.module == api_mod).unwrap();
     assert!((api.abstractness - 1.0).abs() < f64::EPSILON, "all interfaces → A=1.0");
     assert!(api.instability < f64::EPSILON, "no fan-out → I=0");
@@ -196,7 +196,7 @@ fn distance_pure_concrete_module() {
         edge(impl_file, api_file),
     ];
     let snap = make_snapshot_with_files(edges.clone(), files);
-    let results = compute_distance_from_main_seq(&snap, &edges);
+    let results = compute_distance_from_main_seq(&snap, &edges, None);
     let imp = results.iter().find(|m| m.module == impl_mod).unwrap();
     assert!(imp.abstractness < f64::EPSILON, "all classes → A=0.0");
     assert!((imp.instability - 1.0).abs() < f64::EPSILON, "pure fan-out → I=1.0");
@@ -214,7 +214,7 @@ fn distance_zone_of_pain() {
     ];
     let edges: Vec<ImportEdge> = vec![];
     let snap = make_snapshot_with_files(edges.clone(), files);
-    let results = compute_distance_from_main_seq(&snap, &edges);
+    let results = compute_distance_from_main_seq(&snap, &edges, None);
     let core = results.iter().find(|m| m.module == core_mod).unwrap();
     assert!(core.abstractness < f64::EPSILON);
     assert!((core.distance - 0.5).abs() < f64::EPSILON,
@@ -224,7 +224,7 @@ fn distance_zone_of_pain() {
 #[test]
 fn distance_empty_graph() {
     let snap = make_snapshot_with_files(vec![], vec![]);
-    let results = compute_distance_from_main_seq(&snap, &[]);
+    let results = compute_distance_from_main_seq(&snap, &[], None);
     assert!(results.is_empty(), "no types → no distance data");
 }
 
@@ -256,8 +256,8 @@ fn distance_idempotent() {
     ];
     let edges = vec![edge("mod1/a.rs", "mod2/b.rs")];
     let snap = make_snapshot_with_files(edges.clone(), files);
-    let r1 = compute_distance_from_main_seq(&snap, &edges);
-    let r2 = compute_distance_from_main_seq(&snap, &edges);
+    let r1 = compute_distance_from_main_seq(&snap, &edges, None);
+    let r2 = compute_distance_from_main_seq(&snap, &edges, None);
     assert_eq!(r1.len(), r2.len());
     for (a, b) in r1.iter().zip(r2.iter()) {
         assert!((a.distance - b.distance).abs() < f64::EPSILON);
@@ -278,7 +278,7 @@ fn distance_bounded() {
         edge("c/z.rs", "b/y.rs"),
     ];
     let snap = make_snapshot_with_files(edges.clone(), files);
-    let results = compute_distance_from_main_seq(&snap, &edges);
+    let results = compute_distance_from_main_seq(&snap, &edges, None);
     for m in &results {
         assert!(m.distance >= 0.0 && m.distance <= 1.0,
             "distance must be in [0,1], got {} for module {}", m.distance, m.module);

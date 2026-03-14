@@ -31,7 +31,7 @@ mod tests {
                 file("c/sub/x.rs"), file("c/sub/y.rs"),
             ],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 0.0, "all edges intra-module");
         assert_eq!(report.entropy, 0.0, "intra-module edges must not inflate entropy");
     }
@@ -49,7 +49,7 @@ mod tests {
             edges,
             vec![file("a/x.rs"), file("b/y.rs"), file("c/z.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         // 3 pairs, each with 1/3 probability → H = log2(3) → normalized = 1.0
         assert!((report.entropy - 1.0).abs() < 0.01);
     }
@@ -67,7 +67,7 @@ mod tests {
             edges,
             vec![file("src/mod1/a.rs"), file("src/mod1/b.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert!((report.avg_cohesion.unwrap() - 1.0).abs() < f64::EPSILON);
     }
 
@@ -81,7 +81,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("lib/b.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         // Each module has only 1 file → no modules with ≥2 files → cohesion = 0.0
         // Each module (src/, lib/) has only 1 file → no modules with ≥2 files → None
         assert_eq!(report.avg_cohesion, None);
@@ -98,7 +98,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         let a_metric = report.most_unstable.iter().find(|m| m.path == "src/a.rs");
         assert!(a_metric.is_some());
         assert!((a_metric.unwrap().instability - 1.0).abs() < f64::EPSILON);
@@ -115,7 +115,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         // b.rs has fan_in=2, fan_out=0 → I = 0/(2+0) = 0.0
         let b_metric = report.most_unstable.iter().find(|m| m.path == "src/b.rs");
         if let Some(m) = b_metric {
@@ -142,7 +142,7 @@ mod tests {
             lang: "rust".to_string(),
             confidence: "high".to_string(),
         }];
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.max_depth, 3);
     }
 
@@ -171,7 +171,7 @@ mod tests {
                 files_vec.push(file(&format!("src/extra{}.rs", i)));
             }
             let snap = snap_with_edges(edges, files_vec);
-            compute_health(&snap)
+            compute_health(&snap, None)
         };
         let small = make_project(0);   // 21 files, 1 god → 4.8%
         let large = make_project(200);  // 221 files, 1 god → 0.45%
@@ -198,7 +198,7 @@ mod tests {
             lang: "rust".to_string(),
             confidence: "high".to_string(),
         }];
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert!(report.god_files.is_empty(), "entry-point files should not be flagged as god files");
     }
 
@@ -207,7 +207,7 @@ mod tests {
     fn no_entry_points_uses_root_nodes() {
         let edges = vec![edge("src/a.rs", "src/b.rs")];
         let snap = snap_with_edges(edges, vec![file("src/a.rs"), file("src/b.rs")]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.max_depth, 1, "should compute depth from root nodes when no entry points");
     }
 
@@ -272,7 +272,7 @@ mod tests {
         f.lines = 100;
         f.comments = 20;
         let snap = snap_with_edges(Vec::new(), vec![f]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert!((report.comment_ratio.unwrap() - 0.20).abs() < 0.01);
         assert_eq!(report.dimensions.comment, Some('A')); // 20% >= 8%
     }
@@ -283,7 +283,7 @@ mod tests {
         big.lines = 600; // > 500 threshold
         let small = file("src/small.rs"); // 100 lines
         let snap = snap_with_edges(Vec::new(), vec![big, small]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.large_file_count, 1);
         assert!((report.large_file_ratio - 0.5).abs() < 0.01); // 1/2 = 50%
         assert_eq!(report.dimensions.file_size, 'F'); // 50% > 5%
@@ -307,7 +307,7 @@ mod tests {
             children: None,
         };
         let snap = snap_with_edges(Vec::new(), vec![f]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.long_functions.len(), 1);
         assert!((report.long_fn_ratio - 0.5).abs() < 0.01); // 1/2 = 50%
         assert_eq!(report.dimensions.long_fn, 'F'); // 50% > 35%

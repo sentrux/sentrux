@@ -507,22 +507,23 @@ fn compute_module_metrics(
     files: &[&FileNode],
     import_edges: &[ImportEdge],
     entry_points: &[EntryPoint],
+    module_depth: Option<usize>,
 ) -> ModuleMetrics {
     // Caller (`compute_health`) already filtered mod-declaration edges,
     // so `import_edges` here are pure functional dependencies.
     let dep_edges = import_edges;
 
-    let stable_modules = compute_stable_modules(dep_edges);
+    let stable_modules = compute_stable_modules(dep_edges, module_depth);
     let (coupling_score, cross_module_edges, _) =
-        compute_coupling_score(dep_edges, &stable_modules);
-    let (entropy_raw, entropy_bits, entropy_num_pairs) = compute_shannon_entropy(dep_edges, &stable_modules);
+        compute_coupling_score(dep_edges, &stable_modules, module_depth);
+    let (entropy_raw, entropy_bits, entropy_num_pairs) = compute_shannon_entropy(dep_edges, &stable_modules, module_depth);
     // Scale entropy by coupling: low coupling means few cross-module edges,
     // so entropy of their distribution is less meaningful. Use B-threshold (0.35)
     // as denominator for gradual dampening instead of binary cutoff at A-threshold.
     let magnitude = (coupling_score / 0.35).min(1.0);
     let entropy = entropy_raw * magnitude;
 
-    let avg_cohesion = compute_avg_cohesion(dep_edges, files);
+    let avg_cohesion = compute_avg_cohesion(dep_edges, files, module_depth);
     let max_depth = compute_max_depth(dep_edges, entry_points);
     let circular_dep_files = detect_cycles(dep_edges);
     let circular_dep_count = circular_dep_files.len();
@@ -535,7 +536,12 @@ fn compute_module_metrics(
 
 /// Compute a comprehensive code health report from a scan snapshot.
 /// Evaluates coupling, complexity, dead code, duplication, and more.
-pub fn compute_health(snapshot: &Snapshot) -> HealthReport {
+///
+/// `module_depth` controls how deep the module boundary detection goes:
+/// - `None` (default): depth-3 (fine-grained sub-modules)
+/// - `Some(2)`: depth-2 (coarser grouping, better for monorepos)
+/// - `Some(3)`: equivalent to None
+pub fn compute_health(snapshot: &Snapshot, module_depth: Option<usize>) -> HealthReport {
     let files = crate::core::snapshot::flatten_files_ref(&snapshot.root);
     // Filter mod-declaration edges once at the top. `pub mod foo;` is structural
     // containment, not a functional dependency — consistent across ALL metrics.
@@ -545,7 +551,7 @@ pub fn compute_health(snapshot: &Snapshot) -> HealthReport {
         .collect();
 
     let fm = compute_file_metrics(&files, &dep_edges, &snapshot.entry_points);
-    let mm = compute_module_metrics(&files, &dep_edges, &snapshot.entry_points);
+    let mm = compute_module_metrics(&files, &dep_edges, &snapshot.entry_points, module_depth);
 
     // Raw unfiltered data for rules engine (user thresholds may be stricter than hardcoded ones)
     let all_function_ccs = collect_all_function_ccs(&files);

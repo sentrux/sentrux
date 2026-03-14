@@ -4,7 +4,7 @@
 //! depth heuristics. Handles depth-2 and depth-3 boundaries, dominant
 //! directory stripping (src/, lib/), and extension removal. Used throughout
 //! the metrics and analysis layers to assign files to logical modules.
-//! Public functions: `module_of`, `is_same_module`.
+//! Public functions: `module_of`, `module_of_at_depth`, `is_same_module`.
 
 /// Adaptive module boundary detection.
 ///
@@ -50,8 +50,13 @@ fn module_of_root_file(path: &str) -> &str {
 }
 
 /// Handle files at >=2 directory levels.
-/// Returns depth-3 module if 3+ levels, depth-2 module if exactly 2 levels.
-fn module_of_deep(path: &str, _first_slash: usize, depth2_end: usize) -> &str {
+/// Returns depth-3 module if 3+ levels (and max_depth >= 3), depth-2 module if exactly 2 levels
+/// or if max_depth <= 2.
+fn module_of_deep(path: &str, _first_slash: usize, depth2_end: usize, max_depth: usize) -> &str {
+    if max_depth <= 2 {
+        // Cap at depth-2: never look for a third slash
+        return &path[..depth2_end];
+    }
     let after_depth2 = &path[depth2_end + 1..];
     match after_depth2.find('/') {
         Some(j) => &path[..depth2_end + 1 + j],
@@ -79,8 +84,15 @@ fn module_of_single_dir(path: &str, first_slash: usize) -> &str {
     }
 }
 
-/// Extract the module name from a file path using adaptive directory depth.
-pub fn module_of(path: &str) -> &str {
+/// Extract the module name from a file path using adaptive directory depth,
+/// capped at `max_depth` directory levels.
+///
+/// When `max_depth <= 2`, the result is always a depth-2 prefix (no depth-3
+/// sub-module detection). This is useful for monorepos where package boundaries
+/// are at depth-2 and depth-3 produces overly fine-grained groupings.
+///
+/// When `max_depth >= 3`, behavior is identical to `module_of`.
+pub fn module_of_at_depth(path: &str, max_depth: usize) -> &str {
     let first_slash = match path.find('/') {
         Some(i) => i,
         None => return module_of_root_file(path),
@@ -88,9 +100,14 @@ pub fn module_of(path: &str) -> &str {
 
     let rest = &path[first_slash + 1..];
     match rest.find('/') {
-        Some(i) => module_of_deep(path, first_slash, first_slash + 1 + i),
+        Some(i) => module_of_deep(path, first_slash, first_slash + 1 + i, max_depth),
         None => module_of_single_dir(path, first_slash),
     }
+}
+
+/// Extract the module name from a file path using adaptive directory depth.
+pub fn module_of(path: &str) -> &str {
+    module_of_at_depth(path, 3)
 }
 
 /// Check if two file paths belong to the same module boundary.
@@ -190,5 +207,21 @@ mod tests {
         // Different modules
         assert_ne!(module_of("analysis/scanner.rs"), module_of("metrics/arch.rs"));
         assert_ne!(module_of("src/app.rs"), module_of("src/settings.rs"));
+    }
+
+    #[test]
+    fn module_of_at_depth_caps_at_depth2() {
+        // depth-2: never go deeper than the second directory level
+        assert_eq!(module_of_at_depth("backend/src/plugins/admin.ts", 2), "backend/src");
+        // depth-3 (default): goes to third level
+        assert_eq!(module_of_at_depth("backend/src/plugins/admin.ts", 3), "backend/src/plugins");
+        // depth-2 on a 2-level path: same as depth-3
+        assert_eq!(module_of_at_depth("backend/src/admin.ts", 2), "backend/src");
+        // depth-2 on a root file: unchanged
+        assert_eq!(module_of_at_depth("main.rs", 2), "main");
+        // depth-2 on deeply nested path: still capped at depth-2
+        assert_eq!(module_of_at_depth("a/b/c/d/e.rs", 2), "a/b");
+        // module_of delegates to depth-3
+        assert_eq!(module_of("backend/src/plugins/admin.ts"), module_of_at_depth("backend/src/plugins/admin.ts", 3));
     }
 }

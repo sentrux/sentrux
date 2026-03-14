@@ -32,7 +32,10 @@ pub(crate) fn do_scan(root: &Path) -> Result<(Snapshot, metrics::HealthReport, a
             max_call_targets: s.max_call_targets,
         },
     ).map_err(|e| format!("Scan failed: {e}"))?;
-    let health = metrics::compute_health(&result.snapshot);
+    // Try to load module_depth from .sentrux/rules.toml if present.
+    let module_depth = crate::metrics::rules::RulesConfig::try_load(root)
+        .and_then(|cfg| cfg.constraints.module_depth);
+    let health = metrics::compute_health(&result.snapshot, module_depth);
     let arch_report = arch::compute_arch(&result.snapshot);
     Ok((result.snapshot, health, arch_report))
 }

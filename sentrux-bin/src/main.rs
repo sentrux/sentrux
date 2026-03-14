@@ -191,7 +191,7 @@ fn run_check(path: &str) -> i32 {
         }
     };
 
-    let health = metrics::compute_health(&result.snapshot);
+    let health = metrics::compute_health(&result.snapshot, config.constraints.module_depth);
     let arch_report = metrics::arch::compute_arch(&result.snapshot);
     let check = metrics::rules::check_rules(&config, &health, &arch_report, &result.snapshot.import_graph);
 
@@ -253,7 +253,7 @@ fn run_gate(path: &str, save_mode: bool) -> i32 {
         }
     };
 
-    let health = metrics::compute_health(&result.snapshot);
+    let health = metrics::compute_health(&result.snapshot, None);
     let arch_report = metrics::arch::compute_arch(&result.snapshot);
 
     if save_mode {

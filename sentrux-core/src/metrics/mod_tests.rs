@@ -15,7 +15,7 @@ mod tests {
     #[test]
     fn empty_graph_is_healthy() {
         let snap = snap_with_edges(Vec::new(), Vec::new());
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.grade, 'A');
         assert_eq!(report.coupling_score, 0.0);
         assert_eq!(report.circular_dep_count, 0);
@@ -31,7 +31,7 @@ mod tests {
             edge("src/b.rs", "src/a.rs"),
         ];
         let snap = snap_with_edges(edges, vec![file("src/a.rs"), file("src/b.rs")]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.circular_dep_count, 1);
         assert_eq!(report.circular_dep_files[0].len(), 2);
     }
@@ -48,7 +48,7 @@ mod tests {
             edges,
             vec![file("src/mod1/a.rs"), file("src/mod1/b.rs"), file("src/mod1/c.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 0.0);
         assert_eq!(report.cross_module_edges, 0);
     }
@@ -67,7 +67,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("src/b.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 1.0, "flat files under dominant dir are separate modules");
         assert_eq!(report.cross_module_edges, 1);
     }
@@ -83,7 +83,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("lib/b.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 1.0, "files in different dirs are different modules");
         assert_eq!(report.cross_module_edges, 1);
     }
@@ -99,7 +99,7 @@ mod tests {
             edges,
             vec![file("src/mod1/a.rs"), file("src/mod1/b.rs"), file("lib/c.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert!((report.coupling_score - 0.5).abs() < f64::EPSILON);
         assert_eq!(report.cross_module_edges, 1);
     }
@@ -125,7 +125,7 @@ mod tests {
                 file("src/models/admin.rs"),
             ],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 0.0, "same depth-2 module should not count as cross-module");
     }
 
@@ -145,7 +145,7 @@ mod tests {
                 file("src/models/base.rs"),
             ],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert!((report.coupling_score - 0.5).abs() < f64::EPSILON,
             "1 cross-module out of 2 edges = 50% coupling");
     }
@@ -163,7 +163,7 @@ mod tests {
             edges,
             vec![file("src/app.rs"), file("src/layout/types.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 1.0,
             "root-level src/app.rs importing src/layout/ IS cross-module");
     }
@@ -183,7 +183,7 @@ mod tests {
                 file("services/api/handler.rs"),
             ],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.coupling_score, 1.0, "cross first-level dirs = 100% coupling");
     }
 
@@ -195,8 +195,8 @@ mod tests {
             edge("lib/b.rs", "src/a.rs"),
         ];
         let snap = snap_with_edges(edges, vec![file("src/a.rs"), file("lib/b.rs")]);
-        let r1 = compute_health(&snap);
-        let r2 = compute_health(&snap);
+        let r1 = compute_health(&snap, None);
+        let r2 = compute_health(&snap, None);
         assert_eq!(r1.grade, r2.grade);
         assert_eq!(r1.coupling_score, r2.coupling_score);
         assert_eq!(r1.circular_dep_count, r2.circular_dep_count);
@@ -210,7 +210,7 @@ mod tests {
             vec![edge("src/a.rs", "src/b.rs")],
             vec![file("src/a.rs"), file("src/b.rs")],
         );
-        let r0 = compute_health(&snap0);
+        let r0 = compute_health(&snap0, None);
 
         // 1 cycle
         let snap1 = snap_with_edges(
@@ -220,7 +220,7 @@ mod tests {
             ],
             vec![file("src/a.rs"), file("src/b.rs")],
         );
-        let r1 = compute_health(&snap1);
+        let r1 = compute_health(&snap1, None);
 
         assert!(r0.grade <= r1.grade); // A < B < C < D < F
     }
@@ -237,7 +237,7 @@ mod tests {
             edges,
             vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.circular_dep_count, 1);
         assert_eq!(report.circular_dep_files[0].len(), 3);
     }
@@ -253,7 +253,7 @@ mod tests {
             files_vec.push(file(&target));
         }
         let snap = snap_with_edges(edges, files_vec);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.god_files.len(), 1);
         assert_eq!(report.god_files[0].path, "src/god.rs");
         assert_eq!(report.god_files[0].value, 20);
@@ -295,7 +295,7 @@ mod tests {
             children: None,
         };
         let snap = snap_with_edges(Vec::new(), vec![f]);
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.complex_functions.len(), 1);
         assert_eq!(report.complex_functions[0].func, "monster_func");
         assert_eq!(report.complex_functions[0].value, 25);
@@ -315,7 +315,7 @@ mod tests {
             edges,
             vec![file("src/mod1/a.rs"), file("src/mod1/c.rs"), file("src/mod2/b.rs")],
         );
-        let report = compute_health(&snap);
+        let report = compute_health(&snap, None);
         assert_eq!(report.entropy, 0.0);
     }
 

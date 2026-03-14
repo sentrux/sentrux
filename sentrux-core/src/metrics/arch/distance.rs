@@ -75,9 +75,10 @@ const FOUNDATION_INSTABILITY_THRESHOLD: f64 = 0.30;
 pub fn compute_distance_from_main_seq(
     snapshot: &Snapshot,
     edges: &[ImportEdge],
+    module_depth: Option<usize>,
 ) -> Vec<ModuleDistance> {
     // 1. Count abstract and total types per module
-    let (module_abstract, module_total) = count_types_per_module(&snapshot.root);
+    let (module_abstract, module_total) = count_types_per_module(&snapshot.root, module_depth);
 
     // 2. Compute per-module fan-in (Ca) and fan-out (Ce) from import edges.
     // Filter mod-declaration edges (Rust `pub mod foo;`) — structural containment
@@ -86,7 +87,7 @@ pub fn compute_distance_from_main_seq(
         .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
         .cloned()
         .collect();
-    let (module_fan_out, module_fan_in) = compute_module_coupling(&dep_edges);
+    let (module_fan_out, module_fan_in) = compute_module_coupling(&dep_edges, module_depth);
 
     // 3. Compute distance for each module that has types
     let mut results = build_module_distances(
@@ -103,10 +104,11 @@ pub fn compute_distance_from_main_seq(
 /// Recursively count abstract and total types per module from the file tree.
 fn count_types_per_module(
     root: &crate::core::types::FileNode,
+    module_depth: Option<usize>,
 ) -> (HashMap<String, usize>, HashMap<String, usize>) {
     let mut module_abstract: HashMap<String, usize> = HashMap::new();
     let mut module_total: HashMap<String, usize> = HashMap::new();
-    walk_types(root, &mut module_abstract, &mut module_total);
+    walk_types(root, &mut module_abstract, &mut module_total, module_depth);
     (module_abstract, module_total)
 }
 
@@ -140,12 +142,16 @@ fn count_file_types(
     node: &crate::core::types::FileNode,
     module_abstract: &mut HashMap<String, usize>,
     module_total: &mut HashMap<String, usize>,
+    module_depth: Option<usize>,
 ) {
     let classes = match node.sa.as_ref().and_then(|sa| sa.cls.as_ref()) {
         Some(cls) if !cls.is_empty() => cls,
         _ => return,
     };
-    let module = crate::core::path_utils::module_of(&node.path).to_string();
+    let module = match module_depth {
+        Some(d) => crate::core::path_utils::module_of_at_depth(&node.path, d).to_string(),
+        None => crate::core::path_utils::module_of(&node.path).to_string(),
+    };
     // Count abstract and total in a single pass, then insert once to avoid N string clones.
     let mut total_count = 0usize;
     let mut abstract_count = 0usize;
@@ -165,28 +171,36 @@ fn walk_types(
     node: &crate::core::types::FileNode,
     module_abstract: &mut HashMap<String, usize>,
     module_total: &mut HashMap<String, usize>,
+    module_depth: Option<usize>,
 ) {
     if node.is_dir {
         if let Some(children) = &node.children {
             for child in children {
-                walk_types(child, module_abstract, module_total);
+                walk_types(child, module_abstract, module_total, module_depth);
             }
         }
         return;
     }
-    count_file_types(node, module_abstract, module_total);
+    count_file_types(node, module_abstract, module_total, module_depth);
 }
 
 /// Compute cross-module fan-in (Ca) and fan-out (Ce) from import edges.
 fn compute_module_coupling(
     edges: &[ImportEdge],
+    module_depth: Option<usize>,
 ) -> (HashMap<String, HashSet<String>>, HashMap<String, HashSet<String>>) {
     let mut module_fan_out: HashMap<String, HashSet<String>> = HashMap::new();
     let mut module_fan_in: HashMap<String, HashSet<String>> = HashMap::new();
 
     for edge in edges {
-        let from_mod = crate::core::path_utils::module_of(&edge.from_file).to_string();
-        let to_mod = crate::core::path_utils::module_of(&edge.to_file).to_string();
+        let from_mod = match module_depth {
+            Some(d) => crate::core::path_utils::module_of_at_depth(&edge.from_file, d).to_string(),
+            None => crate::core::path_utils::module_of(&edge.from_file).to_string(),
+        };
+        let to_mod = match module_depth {
+            Some(d) => crate::core::path_utils::module_of_at_depth(&edge.to_file, d).to_string(),
+            None => crate::core::path_utils::module_of(&edge.to_file).to_string(),
+        };
         if from_mod != to_mod {
             module_fan_out.entry(from_mod.clone()).or_default().insert(to_mod.clone());
             module_fan_in.entry(to_mod).or_default().insert(from_mod);

@@ -67,6 +67,16 @@ impl ArchAnalyzer for DefaultArchAnalyzer {
     }
 }
 
+// ── Internal helpers ──
+
+/// Depth-aware module path extraction for arch metrics.
+fn module_of_path(path: &str, module_depth: Option<usize>) -> String {
+    match module_depth {
+        Some(d) => crate::core::path_utils::module_of_at_depth(path, d).to_string(),
+        None => crate::core::path_utils::module_of(path).to_string(),
+    }
+}
+
 // ── Named constants [ref:736ae249] ──
 
 /// Maximum allowed upward-dependency ratio before grading as F.
@@ -281,6 +291,10 @@ impl ArchBaseline {
 /// logic modules, not from internal helpers of stable infrastructure modules.
 /// [ref:28b7bc6f]
 pub fn grade_blast_concentration(blast_radius: &HashMap<String, u32>, edges: &[ImportEdge]) -> char {
+    grade_blast_concentration_depth(blast_radius, edges, None)
+}
+
+fn grade_blast_concentration_depth(blast_radius: &HashMap<String, u32>, edges: &[ImportEdge], module_depth: Option<usize>) -> char {
     if blast_radius.is_empty() || edges.is_empty() {
         return 'A';
     }
@@ -289,11 +303,11 @@ pub fn grade_blast_concentration(blast_radius: &HashMap<String, u32>, edges: &[I
         return 'A';
     }
 
-    let (mod_fan_out, mod_fan_in) = compute_blast_module_coupling(edges);
+    let (mod_fan_out, mod_fan_in) = compute_blast_module_coupling(edges, module_depth);
     let file_fan_in = compute_blast_file_fan_in(edges);
 
     let max_non_foundation = find_max_non_foundation_blast(
-        blast_radius, &mod_fan_out, &mod_fan_in, &file_fan_in,
+        blast_radius, &mod_fan_out, &mod_fan_in, &file_fan_in, module_depth,
     );
 
     let ratio = max_non_foundation as f64 / total_files as f64;
@@ -309,6 +323,7 @@ pub fn grade_blast_concentration(blast_radius: &HashMap<String, u32>, edges: &[I
 /// parent module fan-out without representing functional dependencies.
 fn compute_blast_module_coupling(
     edges: &[ImportEdge],
+    module_depth: Option<usize>,
 ) -> (HashMap<String, HashSet<String>>, HashMap<String, HashSet<String>>) {
     let mut mod_fan_out: HashMap<String, HashSet<String>> = HashMap::new();
     let mut mod_fan_in: HashMap<String, HashSet<String>> = HashMap::new();
@@ -316,8 +331,8 @@ fn compute_blast_module_coupling(
         if crate::metrics::types::is_mod_declaration_edge(edge) {
             continue;
         }
-        let from_mod = crate::core::path_utils::module_of(&edge.from_file).to_string();
-        let to_mod = crate::core::path_utils::module_of(&edge.to_file).to_string();
+        let from_mod = module_of_path(&edge.from_file, module_depth);
+        let to_mod = module_of_path(&edge.to_file, module_depth);
         if from_mod != to_mod {
             mod_fan_out.entry(from_mod.clone()).or_default().insert(to_mod.clone());
             mod_fan_in.entry(to_mod).or_default().insert(from_mod);
@@ -342,6 +357,7 @@ fn find_max_non_foundation_blast(
     mod_fan_out: &HashMap<String, HashSet<String>>,
     mod_fan_in: &HashMap<String, HashSet<String>>,
     file_fan_in: &HashMap<&str, usize>,
+    module_depth: Option<usize>,
 ) -> u32 {
     const MOD_STABILITY_THRESHOLD: f64 = 0.25;
     const MIN_MOD_FAN_IN: usize = 2;
@@ -360,7 +376,7 @@ fn find_max_non_foundation_blast(
 
     let mut max_non_foundation: u32 = 0;
     for (path, &blast) in blast_radius {
-        let module = crate::core::path_utils::module_of(path).to_string();
+        let module = module_of_path(path, module_depth);
         let ca = file_fan_in.get(path.as_str()).copied().unwrap_or(0);
         // Package-index files (__init__.py, index.js, mod.rs, etc.) are barrel
         // re-exporters — their high blast radius reflects re-exports, not genuine
@@ -427,6 +443,15 @@ pub(crate) fn grade_levelization(upward_ratio: f64) -> char {
 
 /// Compute architecture report from a snapshot.
 pub fn compute_arch(snapshot: &Snapshot) -> ArchReport {
+    compute_arch_with_depth(snapshot, None)
+}
+
+/// Compute architecture report from a snapshot with configurable module depth.
+///
+/// `module_depth` controls how deep the module boundary detection goes:
+/// - `None` (default): depth-3 (fine-grained sub-modules)
+/// - `Some(2)`: depth-2 (coarser grouping, better for monorepos)
+pub fn compute_arch_with_depth(snapshot: &Snapshot, module_depth: Option<usize>) -> ArchReport {
     let edges = &snapshot.import_graph;
 
     // Filter mod-declaration edges (Rust `pub mod foo;`) from levelization.
@@ -461,7 +486,7 @@ pub fn compute_arch(snapshot: &Snapshot) -> ArchReport {
     let (attack_surface_files, total_graph_files, attack_surface_ratio,
          distance_metrics, avg_distance, distance_grade,
          blast_grade, surface_grade, arch_grade) =
-        compute_arch_secondary(snapshot, edges, &dep_edges, &blast_radius, levelization_grade);
+        compute_arch_secondary(snapshot, edges, &dep_edges, &blast_radius, levelization_grade, module_depth);
 
     ArchReport {
         levels,
@@ -492,6 +517,7 @@ fn compute_arch_secondary(
     dep_edges: &[ImportEdge],
     blast_radius: &HashMap<String, u32>,
     levelization_grade: char,
+    module_depth: Option<usize>,
 ) -> (u32, u32, f64, Vec<ModuleDistance>, f64, char, char, char, char) {
     let (attack_surface_files, total_graph_files) =
         compute_attack_surface(dep_edges, &snapshot.entry_points);
@@ -502,13 +528,13 @@ fn compute_arch_secondary(
     };
 
     // Distance from Main Sequence (Martin 2003)
-    let distance_metrics = distance_mod::compute_distance_from_main_seq(snapshot, edges);
+    let distance_metrics = distance_mod::compute_distance_from_main_seq(snapshot, edges, module_depth);
     let (avg_distance, distance_grade) = compute_distance_grade(&distance_metrics);
 
     // Overall architecture grade — composite conformance score.
     let (blast_grade, surface_grade, arch_grade) =
         compute_arch_grades(snapshot, edges, blast_radius, levelization_grade,
-                            attack_surface_ratio, distance_grade);
+                            attack_surface_ratio, distance_grade, module_depth);
 
     (attack_surface_files, total_graph_files, attack_surface_ratio,
      distance_metrics, avg_distance, distance_grade, blast_grade, surface_grade, arch_grade)
@@ -544,8 +570,9 @@ fn compute_arch_grades(
     levelization_grade: char,
     attack_surface_ratio: f64,
     distance_grade: char,
+    module_depth: Option<usize>,
 ) -> (char, char, char) {
-    let blast_grade = grade_blast_concentration(blast_radius, edges);
+    let blast_grade = grade_blast_concentration_depth(blast_radius, edges, module_depth);
     // Applications (with main()) naturally have ~100% reachable code.
     // Grading attack surface for apps penalizes correct architecture.
     let surface_grade = if is_application(snapshot) {
