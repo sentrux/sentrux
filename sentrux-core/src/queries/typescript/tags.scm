@@ -111,6 +111,14 @@
     property: (property_identifier) @name)
   arguments: (_) @reference.call)
 
+; ---- Function reference in property value (e.g. handler: handleFoo) ----
+; Detects function references passed as object property values.
+; Covers framework patterns: Hapi handler:, Express middleware:, etc.
+
+(pair
+  key: (property_identifier)
+  value: (identifier) @name) @reference.call
+
 ; ---- Import appendix (custom) ----
 
 (import_statement

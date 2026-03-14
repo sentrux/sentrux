@@ -223,7 +223,11 @@ fn resolve_single_specifier(
 ) -> Option<ImportEdge> {
     ctx.resolved_count.fetch_add(1, Ordering::Relaxed);
     let resolution = resolver.resolve(dir, specifier).ok()?;
-    let full_path = resolution.full_path().to_path_buf();
+    // Canonicalize resolved path to match canonicalized scan_root.
+    // On macOS, /tmp → /private/tmp symlink causes strip_prefix to fail
+    // if only one side is canonicalized.
+    let full_path = resolution.full_path().canonicalize()
+        .unwrap_or_else(|_| resolution.full_path().to_path_buf());
     let rel = full_path.strip_prefix(ctx.scan_root).ok()?;
     let rel_str = rel.to_string_lossy();
     if ctx.known_files.contains(rel_str.as_ref()) && rel_str.as_ref() != from_path {

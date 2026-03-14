@@ -100,6 +100,12 @@
  (call_expression)
 ]))) @definition.constant
 
+; ---- Function reference in property value (e.g. handler: handleFoo) ----
+
+(pair
+  key: (property_identifier)
+  value: (identifier) @name) @reference.call
+
 ; ---- Import appendix (custom) ----
 
 (import_statement
