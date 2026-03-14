@@ -61,6 +61,14 @@ fn detect_ruby_spec() {
 }
 
 #[test]
+fn detect_elixir_test() {
+    assert!(is_test_file("test/product_test.exs"));
+    assert!(is_test_file("test/inventory/product_test.exs"));
+    assert!(is_test_file("test/support/factory.ex"));
+    assert!(!is_test_file("lib/inventory/product.ex"));
+}
+
+#[test]
 fn detect_dir_patterns() {
     assert!(is_test_file("test/integration/api.rs"));
     assert!(is_test_file("tests/unit/math.py"));

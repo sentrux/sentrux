@@ -244,7 +244,7 @@ fn is_test_directory(lower: &str) -> bool {
 
 /// File suffixes that indicate test files (checked against lowered filename).
 const TEST_SUFFIXES: &[&str] = &[
-    "_test.rs", "_test.go", "_test.py",
+    "_test.rs", "_test.go", "_test.py", "_test.exs",
     ".test.js", ".test.ts", ".test.tsx", ".test.jsx",
     ".spec.js", ".spec.ts", ".spec.tsx", ".spec.jsx",
     "_spec.rb",

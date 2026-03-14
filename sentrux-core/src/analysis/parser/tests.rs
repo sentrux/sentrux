@@ -501,4 +501,35 @@ main "$@"
         assert!(sa.imp.is_none() || sa.imp.as_ref().unwrap().is_empty(), "should have no imports");
     }
 
+    #[test]
+    fn oracle_elixir_imports() {
+        let code = br#"
+defmodule Acme.Inventory.Command.UpdateStock do
+  alias Acme.Shared.V1
+  alias Acme.Domain.ProductId
+
+  alias Acme.Inventory.Domain.{
+    Product,
+    ProductNotFoundError,
+    InsufficientStockError
+  }
+
+  use Acme.Core.CommandHandler
+end
+"#;
+        let sa = parse_bytes(code, "elixir").expect("elixir parse failed");
+        let imp = sa.imp.as_ref().expect("no imports");
+        eprintln!("Elixir imports extracted: {:?}", imp);
+        // Should have:
+        // - acme/shared/v1
+        // - acme/domain/product_id
+        // - acme/inventory/domain/product
+        // - acme/inventory/domain/product_not_found_error
+        // - acme/inventory/domain/insufficient_stock_error
+        // - acme/core/command_handler
+        assert!(imp.len() >= 6, "expected at least 6 imports, got {}: {:?}", imp.len(), imp);
+        assert!(imp.contains(&"acme/inventory/domain/product".to_string()), "missing product");
+        assert!(imp.contains(&"acme/inventory/domain/product_not_found_error".to_string()), "missing product_not_found_error");
+    }
+
 }

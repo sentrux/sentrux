@@ -325,13 +325,14 @@ pub(super) fn extract_elixir(text: &str) -> Vec<String> {
 
     let rest = rest.trim_start();
 
-    // Stop at first newline (multi-line do blocks)
-    let rest = rest.split('\n').next().unwrap_or(rest);
-
-    // Handle multi-alias: alias Collect.{Listing, Offer}
+    // Handle multi-alias first (before splitting on newlines): alias Collect.{Listing, Offer}
+    // Multi-alias can span multiple lines, so we need the full text to find the closing brace.
     if rest.contains('{') {
         return expand_elixir_multi_alias(rest);
     }
+
+    // Stop at first newline (for single-line imports and multi-line do blocks)
+    let rest = rest.split('\n').next().unwrap_or(rest);
 
     // Extract module name: first token (PascalCase segments separated by dots)
     // Stop at comma (options), whitespace after module, or "do"
@@ -346,6 +347,9 @@ pub(super) fn extract_elixir(text: &str) -> Vec<String> {
     }
 
     let path = elixir_module_to_path(module);
+    // Elixir modules are in lib/ directory by convention, but we return the path
+    // without lib/ prefix and let the suffix resolver find it (it will match both
+    // lib/path and test/path variants).
     if path.is_empty() { vec![] } else { vec![path] }
 }
 
