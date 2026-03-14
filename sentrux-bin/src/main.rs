@@ -191,7 +191,11 @@ fn run_check(path: &str) -> i32 {
         }
     };
 
-    let health = metrics::compute_health(&result.snapshot, config.constraints.module_depth);
+    let mcfg = metrics::MetricsConfig {
+        module_depth: config.constraints.module_depth,
+        cohesion_exclude: config.constraints.cohesion_exclude.clone(),
+    };
+    let health = metrics::compute_health_with_config(&result.snapshot, &mcfg);
     let arch_report = metrics::arch::compute_arch(&result.snapshot);
     let check = metrics::rules::check_rules(&config, &health, &arch_report, &result.snapshot.import_graph);
 

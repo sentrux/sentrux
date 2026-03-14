@@ -31,6 +31,11 @@ pub struct Constraints {
     /// Module boundary detection depth (2 = depth-2, 3 = depth-3, default: 3).
     /// Use 2 for monorepos where package boundaries are at depth-2.
     pub module_depth: Option<usize>,
+    /// Glob patterns for files excluded from cohesion file counts.
+    /// Standalone scripts (migrations, seeds) inflate module size without
+    /// contributing edges, penalizing well-structured modules.
+    #[serde(default)]
+    pub cohesion_exclude: Vec<String>,
 }
 
 impl Constraints {

@@ -508,6 +508,7 @@ fn compute_module_metrics(
     import_edges: &[ImportEdge],
     entry_points: &[EntryPoint],
     module_depth: Option<usize>,
+    cohesion_exclude: &[String],
 ) -> ModuleMetrics {
     // Caller (`compute_health`) already filtered mod-declaration edges,
     // so `import_edges` here are pure functional dependencies.
@@ -523,7 +524,7 @@ fn compute_module_metrics(
     let magnitude = (coupling_score / 0.35).min(1.0);
     let entropy = entropy_raw * magnitude;
 
-    let avg_cohesion = compute_avg_cohesion(dep_edges, files, module_depth);
+    let avg_cohesion = compute_avg_cohesion(dep_edges, files, module_depth, cohesion_exclude);
     let max_depth = compute_max_depth(dep_edges, entry_points);
     let circular_dep_files = detect_cycles(dep_edges);
     let circular_dep_count = circular_dep_files.len();
@@ -534,14 +535,27 @@ fn compute_module_metrics(
     }
 }
 
+/// Optional metrics configuration from `.sentrux/rules.toml`.
+/// Bundles settings that affect how health metrics are computed.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsConfig {
+    /// Module boundary detection depth (None = default depth-3).
+    pub module_depth: Option<usize>,
+    /// Glob patterns for files excluded from cohesion file counts.
+    pub cohesion_exclude: Vec<String>,
+}
+
 /// Compute a comprehensive code health report from a scan snapshot.
 /// Evaluates coupling, complexity, dead code, duplication, and more.
-///
-/// `module_depth` controls how deep the module boundary detection goes:
-/// - `None` (default): depth-3 (fine-grained sub-modules)
-/// - `Some(2)`: depth-2 (coarser grouping, better for monorepos)
-/// - `Some(3)`: equivalent to None
 pub fn compute_health(snapshot: &Snapshot, module_depth: Option<usize>) -> HealthReport {
+    compute_health_with_config(snapshot, &MetricsConfig {
+        module_depth,
+        ..Default::default()
+    })
+}
+
+/// Compute health with full metrics configuration.
+pub fn compute_health_with_config(snapshot: &Snapshot, config: &MetricsConfig) -> HealthReport {
     let files = crate::core::snapshot::flatten_files_ref(&snapshot.root);
     // Filter mod-declaration edges once at the top. `pub mod foo;` is structural
     // containment, not a functional dependency — consistent across ALL metrics.
@@ -551,7 +565,7 @@ pub fn compute_health(snapshot: &Snapshot, module_depth: Option<usize>) -> Healt
         .collect();
 
     let fm = compute_file_metrics(&files, &dep_edges, &snapshot.entry_points);
-    let mm = compute_module_metrics(&files, &dep_edges, &snapshot.entry_points, module_depth);
+    let mm = compute_module_metrics(&files, &dep_edges, &snapshot.entry_points, config.module_depth, &config.cohesion_exclude);
 
     // Raw unfiltered data for rules engine (user thresholds may be stricter than hardcoded ones)
     let all_function_ccs = collect_all_function_ccs(&files);

@@ -211,6 +211,24 @@ pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
         return true;
     }
 
+    // Handle `**/suffix` — match suffix anywhere in path
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        // Recursively match the suffix part against path or any subdirectory
+        if glob_match(suffix, path) {
+            return true;
+        }
+        // Try matching after each '/' in the path
+        let mut start = 0;
+        while let Some(pos) = path[start..].find('/') {
+            let abs_pos = start + pos + 1;
+            if abs_pos < path.len() && glob_match(suffix, &path[abs_pos..]) {
+                return true;
+            }
+            start = abs_pos;
+        }
+        return false;
+    }
+
     // Handle `dir/**/*` — match files at any depth under dir (check before `/*`)
     if let Some(prefix) = pattern.strip_suffix("/**/*") {
         return path.starts_with(prefix) && path.len() > prefix.len();

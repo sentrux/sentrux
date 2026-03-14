@@ -236,17 +236,24 @@ pub(crate) fn compute_shannon_entropy(edges: &[ImportEdge], stable_modules: &Has
 /// code never imports from test files. This is the same principle as excluding
 /// entry points from god-file detection: known one-way consumers should not
 /// penalize the metric they can't contribute to.
-pub(crate) fn compute_avg_cohesion(edges: &[ImportEdge], files: &[&crate::core::types::FileNode], module_depth: Option<usize>) -> Option<f64> {
-    // Group files by module (same boundary as coupling), excluding test files.
-    // Test files are one-way consumers (import production code, never imported back).
-    // Including them inflates n without proportional intra-module edges,
-    // artificially deflating cohesion for well-structured modules.
+pub(crate) fn compute_avg_cohesion(edges: &[ImportEdge], files: &[&crate::core::types::FileNode], module_depth: Option<usize>, cohesion_exclude: &[String]) -> Option<f64> {
+    // Group files by module (same boundary as coupling), excluding test files
+    // and user-specified cohesion_exclude patterns (e.g., migrations, seeds).
     let mut mod_files: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in files {
         if f.is_dir || f.lang.is_empty() {
             continue;
         }
+        // Skip files that weren't successfully parsed — they have a detected
+        // language but no grammar or exceeded parse limits. Including them
+        // inflates module size N without contributing any import edges.
+        if f.sa.is_none() {
+            continue;
+        }
         if testgap::is_test_file(&f.path) {
+            continue;
+        }
+        if !cohesion_exclude.is_empty() && cohesion_exclude.iter().any(|pat| crate::metrics::rules::glob_match(pat, &f.path)) {
             continue;
         }
         let m = module_of_depth(&f.path, module_depth);

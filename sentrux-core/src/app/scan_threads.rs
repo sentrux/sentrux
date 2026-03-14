@@ -100,12 +100,14 @@ fn send_scan_result(
     match result {
         Ok(scan_result) => {
             let snap = Arc::new(scan_result.snapshot);
-            // Load module_depth from rules config if present, so health metrics
-            // use the same depth as the rules check.
-            let module_depth = crate::metrics::rules::RulesConfig::try_load(
+            let rules_cfg = crate::metrics::rules::RulesConfig::try_load(
                 std::path::Path::new(root_path)
-            ).and_then(|cfg| cfg.constraints.module_depth);
-            let report = crate::metrics::compute_health(&snap, module_depth);
+            );
+            let mcfg = crate::metrics::MetricsConfig {
+                module_depth: rules_cfg.as_ref().and_then(|c| c.constraints.module_depth),
+                cohesion_exclude: rules_cfg.as_ref().map(|c| c.constraints.cohesion_exclude.clone()).unwrap_or_default(),
+            };
+            let report = crate::metrics::compute_health_with_config(&snap, &mcfg);
             let arch = crate::metrics::arch::compute_arch(&snap);
 
             // Build complexity map once and share between evolution and test gap analysis.
