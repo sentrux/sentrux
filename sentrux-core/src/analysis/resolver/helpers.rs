@@ -80,9 +80,22 @@ pub(super) fn try_suffix_resolve(
     // so we jump straight to the local path instead of progressive stripping.
     if !env.suffix_index.module_prefixes.is_empty() {
         if let Some(local_path) = strip_module_prefix(specifier, &env.suffix_index.module_prefixes) {
-            // Try the module-stripped path through the suffix index
+            // Module-prefix-stripped paths have high confidence of being local
+            // imports. Use pick_closest for disambiguation even with multiple
+            // candidates — this is needed for directory_is_package languages
+            // (Go) where a package import like "parser" maps to every .go file
+            // in that directory.
             if let Some(result) = try_suffix_resolve_inner(&local_path, env, file_dir_str, file_dir) {
                 return Some(result);
+            }
+            // Fallback: direct suffix index lookup with pick_closest.
+            // try_suffix_resolve_inner's len()==1 guard may have rejected a
+            // multi-candidate single-segment match (e.g. "parser" -> 37 files).
+            // Since we know this came from a module prefix, it's safe to pick.
+            if let Some(candidates) = env.suffix_index.index.get(local_path.as_str()) {
+                if !candidates.is_empty() {
+                    return Some(pick_closest(candidates, file_dir_str).to_string());
+                }
             }
         }
     }

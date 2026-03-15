@@ -513,4 +513,45 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn go_flat_package_single_segment_resolves() {
+        // Regression: Go project with a single subpackage at the root level.
+        // `import "github.com/user/repo/parser"` strips to "parser" — a single
+        // segment with many candidates (every .go file in parser/). The suffix
+        // index len()==1 guard previously blocked resolution because "parser"
+        // matched multiple files.
+        let tmp = std::env::temp_dir().join("sentrux_test_go_flat_pkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("parser")).unwrap();
+        std::fs::write(tmp.join("go.mod"),
+            "module github.com/user/myapp\n\ngo 1.21\n").unwrap();
+
+        let files = vec![
+            make_file("main.go", "main.go", "go",
+                Some(StructuralAnalysis {
+                    functions: None, cls: None, co: None, tags: None, comment_lines: None,
+                    imp: Some(vec![
+                        "github.com/user/myapp/parser".to_string(),
+                    ]),
+                }),
+            ),
+            make_file("session.go", "parser/session.go", "go", None),
+            make_file("entry.go", "parser/entry.go", "go", None),
+            make_file("chunk.go", "parser/chunk.go", "go", None),
+        ];
+
+        let refs: Vec<&FileNode> = files.iter().collect();
+        let gr = build_graphs(&refs, Some(&tmp), 5);
+
+        let main_edges: Vec<&ImportEdge> = gr.import_edges.iter()
+            .filter(|e| e.from_file == "main.go").collect();
+
+        assert!(!main_edges.is_empty(),
+            "expected at least 1 import edge from main.go to parser/, got none");
+        assert!(main_edges.iter().all(|e| e.to_file.starts_with("parser/")),
+            "all edges should target parser/, got {:?}", main_edges);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
