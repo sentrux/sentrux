@@ -23,8 +23,4 @@ egui = { workspace = true }
 
 [features]
 default = []
-pro = ["sentrux-core/pro", "dep:sentrux-pro"]
-
-[dependencies.sentrux-pro]
-path = "../../sentrux-pro"
-optional = true
+pro = ["sentrux-core/pro"]
