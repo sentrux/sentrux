@@ -4,7 +4,7 @@
 //! Same uniform signature as handlers.rs: `fn(&Value, &Tier, &mut McpState) -> Result<Value, String>`
 
 use crate::core::snapshot::{self, Snapshot};
-use crate::core::types::FileNode;
+use crate::core::types::{FileNode, ImportEdge};
 use crate::metrics::evolution;
 use crate::metrics::testgap;
 use super::McpState;
@@ -448,6 +448,179 @@ fn handle_file_info(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<
         }
         result["git_history"] = git;
     }
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  TOP FILES — Ranked file listing by metric
+// ══════════════════════════════════════════════════════════════════
+
+pub fn top_files_def() -> ToolDef {
+    ToolDef {
+        name: "top_files",
+        description: "Ranked file listing by a chosen metric — the middle layer between 'health' (project-level) and 'file_info' (single file). Unlike health's per-root-cause lists, this provides a unified cross-metric ranking. Metrics: 'coupling' (fan-in + fan-out), 'fan_in', 'fan_out', 'complexity' (max cyclomatic), 'cognitive' (max cognitive), 'instability', 'blast_radius', 'churn', 'risk' (churn × complexity × coupling composite). Churn/risk metrics are more accurate when git_stats has been called.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "metric": {
+                    "type": "string",
+                    "description": "Metric to rank by: coupling, fan_in, fan_out, complexity, cognitive, instability, blast_radius, churn, risk (default: risk)",
+                    "enum": ["coupling", "fan_in", "fan_out", "complexity", "cognitive", "instability", "blast_radius", "churn", "risk"]
+                },
+                "limit": { "type": "integer", "description": "Number of files to return (default 10, max 50)" }
+            }
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_top_files,
+        invalidates_evolution: false,
+    }
+}
+
+/// Per-file aggregated data for ranking.
+struct FileRankData {
+    path: String,
+    fan_in: usize,
+    fan_out: usize,
+    max_cc: u32,
+    max_cog: u32,
+    instability: f64,
+    blast_radius: u32,
+    churn: u32,
+    lines: u32,
+    risk_score: f64,
+}
+
+fn handle_top_files(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let health = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let metric = args.get("metric").and_then(|m| m.as_str()).unwrap_or("risk");
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10).min(50) as usize;
+
+    // Reuse the canonical fan-map computation from metrics (filters mod-declaration
+    // edges, deduplicates import+call edges). Keyed by owned String.
+    let dep_edges: Vec<ImportEdge> = snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+        .cloned()
+        .collect();
+    let (fan_out_map, fan_in_map) = crate::metrics::compute_fan_maps(&dep_edges, &snap.call_graph);
+
+    // Build per-file data
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let churn_map = state.cached_evolution.as_ref().map(|e| &e.churn);
+
+    let mut ranked: Vec<FileRankData> = all_files.iter()
+        .filter(|f| !f.lang.is_empty() && f.lang != "unknown")
+        .filter(|f| !testgap::is_test_file(&f.path))
+        .map(|f| {
+            let fi = fan_in_map.get(f.path.as_str()).copied().unwrap_or(0);
+            let fo = fan_out_map.get(f.path.as_str()).copied().unwrap_or(0);
+            let total = fi + fo;
+            let inst = if total > 0 { fo as f64 / total as f64 } else { 0.0 };
+            let br = arch.blast_radius.get(&f.path).copied().unwrap_or(0);
+
+            let (max_cc, max_cog) = f.sa.as_ref()
+                .and_then(|sa| sa.functions.as_ref())
+                .map(|funcs| {
+                    let cc = funcs.iter().filter_map(|func| func.cc).max().unwrap_or(1);
+                    let cog = funcs.iter().filter_map(|func| func.cog).max().unwrap_or(0);
+                    (cc, cog)
+                })
+                .unwrap_or((1, 0));
+
+            let churn = churn_map
+                .and_then(|cm| cm.get(&f.path))
+                .map(|c| c.commit_count)
+                .unwrap_or(0);
+
+            // Risk composite: structural reach × complexity × change frequency.
+            // Uses max(blast_radius, coupling) so high-reach files rank even with zero churn.
+            // Churn floor of 1.0 ensures structural-only risk is never zeroed out.
+            let reach = (br as f64).max((fi + fo) as f64);
+            let complexity_factor = max_cc as f64;
+            let churn_factor = (churn as f64).max(1.0);
+            let risk_score = churn_factor * complexity_factor * reach;
+
+            FileRankData {
+                path: f.path.clone(),
+                fan_in: fi,
+                fan_out: fo,
+                max_cc,
+                max_cog,
+                instability: inst,
+                blast_radius: br,
+                churn,
+                lines: f.lines,
+                risk_score,
+            }
+        })
+        .collect();
+
+    // Sort by selected metric (descending = worst first), break ties alphabetically
+    // for deterministic output.
+    let tiebreak = |a: &FileRankData, b: &FileRankData| a.path.cmp(&b.path);
+    match metric {
+        "coupling" => ranked.sort_by(|a, b| (b.fan_in + b.fan_out).cmp(&(a.fan_in + a.fan_out)).then_with(|| tiebreak(a, b))),
+        "fan_in" => ranked.sort_by(|a, b| b.fan_in.cmp(&a.fan_in).then_with(|| tiebreak(a, b))),
+        "fan_out" => ranked.sort_by(|a, b| b.fan_out.cmp(&a.fan_out).then_with(|| tiebreak(a, b))),
+        "complexity" => ranked.sort_by(|a, b| b.max_cc.cmp(&a.max_cc).then_with(|| tiebreak(a, b))),
+        "cognitive" => ranked.sort_by(|a, b| b.max_cog.cmp(&a.max_cog).then_with(|| tiebreak(a, b))),
+        "instability" => ranked.sort_by(|a, b| b.instability.partial_cmp(&a.instability).unwrap_or(std::cmp::Ordering::Equal).then_with(|| tiebreak(a, b))),
+        "blast_radius" => ranked.sort_by(|a, b| b.blast_radius.cmp(&a.blast_radius).then_with(|| tiebreak(a, b))),
+        "churn" => ranked.sort_by(|a, b| b.churn.cmp(&a.churn).then_with(|| tiebreak(a, b))),
+        "risk" | _ => ranked.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| tiebreak(a, b))),
+    }
+
+    ranked.truncate(limit);
+
+    let has_churn = churn_map.is_some();
+
+    let files_json: Vec<Value> = ranked.iter().enumerate().map(|(i, f)| {
+        let mut entry = json!({
+            "rank": i + 1,
+            "path": f.path,
+            "fan_in": f.fan_in,
+            "fan_out": f.fan_out,
+            "coupling": f.fan_in + f.fan_out,
+            "max_cc": f.max_cc,
+            "max_cognitive": f.max_cog,
+            "instability": (f.instability * 10000.0).round() as u32,
+            "blast_radius": f.blast_radius,
+            "lines": f.lines
+        });
+        if has_churn {
+            entry["churn"] = json!(f.churn);
+            entry["risk_score"] = json!((f.risk_score * 100.0).round() as u64);
+        }
+        entry
+    }).collect();
+
+    let mut result = json!({
+        "metric": metric,
+        "total_source_files": all_files.iter().filter(|f| !f.lang.is_empty() && f.lang != "unknown" && !testgap::is_test_file(&f.path)).count(),
+        "showing": ranked.len(),
+        "files": files_json
+    });
+
+    if metric == "risk" && !has_churn {
+        result["note"] = json!("Risk scores use churn=1 (default). Run git_stats first for accurate churn-weighted risk.");
+    }
+    if metric == "churn" && !has_churn {
+        result["note"] = json!("No git history loaded. Run git_stats first to get churn data.");
+    }
+
+    // Cross-reference with health report issues
+    let issues_in_top: usize = ranked.iter().filter(|f| {
+        health.god_files.iter().any(|g| g.path == f.path)
+        || health.hotspot_files.iter().any(|h| h.path == f.path)
+        || health.circular_dep_files.iter().any(|cycle| cycle.contains(&f.path))
+    }).count();
+    result["issues_overlap"] = json!({
+        "files_with_health_issues": issues_in_top,
+        "out_of": ranked.len()
+    });
 
     Ok(result)
 }
