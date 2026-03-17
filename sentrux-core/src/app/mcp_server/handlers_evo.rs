@@ -807,3 +807,256 @@ fn handle_impact_analysis(args: &Value, _tier: &Tier, state: &mut McpState) -> R
 
     Ok(result)
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  SUGGEST REFACTORING — Actionable structural recommendations
+// ══════════════════════════════════════════════════════════════════
+
+pub fn suggest_refactoring_def() -> ToolDef {
+    ToolDef {
+        name: "suggest_refactoring",
+        description: "Prioritized refactoring action plan — turns health diagnostics into concrete next steps. Suggests: split god files, merge tightly-coupled pairs, extract complex functions, break dependency cycles, resolve architectural inversions. Each suggestion includes affected files and estimated impact. Merge suggestions are available when git_stats has been called. Drill into suggested files with 'file_info' or 'impact_analysis'. Optionally scope to a directory.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "description": "Directory path to scope analysis (e.g. 'src/app'). Omit for whole project."
+                },
+                "limit": { "type": "integer", "description": "Max suggestions to return (default 15)" }
+            }
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_suggest_refactoring,
+        invalidates_evolution: false,
+    }
+}
+
+/// A single refactoring suggestion with priority and estimated impact.
+struct Suggestion {
+    category: &'static str,
+    priority: u32,  // higher = more urgent
+    action: String,
+    reason: String,
+    files: Vec<String>,
+    estimated_impact: String,
+}
+
+fn handle_suggest_refactoring(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let health = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let scope = args.get("scope").and_then(|s| s.as_str());
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15).min(50) as usize;
+
+    let in_scope = |path: &str| -> bool {
+        match scope {
+            Some(s) => path.starts_with(s),
+            None => true,
+        }
+    };
+
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    // Filter mod-declaration edges
+    let dep_edges: Vec<ImportEdge> = snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+        .cloned()
+        .collect();
+
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+
+    // ── 1. Split god files (high fan-out, many functions) ──
+    for gf in &health.god_files {
+        if !in_scope(&gf.path) { continue; }
+        let node = all_files.iter().find(|n| n.path == gf.path);
+        let func_count = node.and_then(|n| n.sa.as_ref())
+            .and_then(|sa| sa.functions.as_ref())
+            .map(|f| f.len())
+            .unwrap_or(0);
+        let lines = node.map(|n| n.lines).unwrap_or(0);
+
+        let priority = (gf.value as u32).saturating_mul(10).saturating_add(func_count as u32);
+        suggestions.push(Suggestion {
+            category: "split_file",
+            priority,
+            action: format!("Split '{}' into smaller, focused modules", gf.path),
+            reason: format!(
+                "God file: fan-out={}, {} functions, {} lines. High fan-out means this file knows too much — changes here ripple widely.",
+                gf.value, func_count, lines
+            ),
+            files: vec![gf.path.clone()],
+            estimated_impact: format!("Reducing fan-out from {} to ~{} per module", gf.value, gf.value / 3 + 1),
+        });
+    }
+
+    // ── 2. Break dependency cycles ──
+    for cycle in &health.circular_dep_files {
+        if !cycle.iter().any(|f| in_scope(f)) { continue; }
+        let best_break = crate::metrics::whatif::find_best_cycle_break(&dep_edges, cycle);
+        let (action, files) = if let Some((from, to)) = &best_break {
+            (
+                format!("Break cycle by removing dependency {} → {}. Introduce an interface/trait to invert the dependency.", from, to),
+                vec![from.clone(), to.clone()],
+            )
+        } else {
+            (
+                format!("Break {}-file dependency cycle", cycle.len()),
+                cycle.clone(),
+            )
+        };
+
+        suggestions.push(Suggestion {
+            category: "break_cycle",
+            priority: (cycle.len() as u32).saturating_mul(50),
+            action,
+            reason: format!(
+                "Circular dependency involving {} files: {}. Cycles prevent independent testing and deployment.",
+                cycle.len(),
+                cycle.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ),
+            files,
+            estimated_impact: "Eliminates 1 dependency cycle, improving modularity score".to_string(),
+        });
+    }
+
+    // ── 3. Extract complex functions ──
+    let mut suggested_fns: HashSet<(String, String)> = HashSet::new();
+    for fm in health.complex_functions.iter().chain(health.cog_complex_functions.iter()) {
+        if !in_scope(&fm.file) { continue; }
+        // Only suggest extraction for very complex functions
+        if fm.value < 20 { continue; }
+        // Deduplicate: a function may appear in both complex_functions and cog_complex_functions
+        if !suggested_fns.insert((fm.file.clone(), fm.func.clone())) { continue; }
+
+        // Check if the file has mostly clean functions (good candidate for extraction)
+        let file_complex_count = health.complex_functions.iter()
+            .filter(|f| f.file == fm.file)
+            .count();
+        let total_in_file = all_files.iter()
+            .find(|n| n.path == fm.file)
+            .and_then(|n| n.sa.as_ref())
+            .and_then(|sa| sa.functions.as_ref())
+            .map(|f| f.len())
+            .unwrap_or(0);
+
+        if total_in_file > 0 && file_complex_count <= total_in_file / 3 {
+            suggestions.push(Suggestion {
+                category: "extract_function",
+                priority: fm.value.saturating_mul(5),
+                action: format!("Extract/refactor '{}' in '{}'", fm.func, fm.file),
+                reason: format!(
+                    "Complexity {} (threshold: 15). This function is significantly more complex than its siblings — a good candidate for decomposition.",
+                    fm.value
+                ),
+                files: vec![fm.file.clone()],
+                estimated_impact: format!("Reduce complexity from {} to ~{} per extracted piece", fm.value, fm.value / 3 + 1),
+            });
+        }
+    }
+
+    // ── 4. Merge tightly-coupled file pairs (from change coupling) ──
+    if let Some(evo) = state.cached_evolution.as_ref() {
+        for cp in evo.coupling_pairs.iter().take(20) {
+            if !in_scope(&cp.file_a) && !in_scope(&cp.file_b) { continue; }
+            if cp.coupling_strength < 0.5 { continue; }
+
+            // Check if they're also import-coupled
+            let a_imports_b = dep_edges.iter().any(|e| e.from_file == cp.file_a && e.to_file == cp.file_b);
+            let b_imports_a = dep_edges.iter().any(|e| e.from_file == cp.file_b && e.to_file == cp.file_a);
+
+            if a_imports_b || b_imports_a {
+                suggestions.push(Suggestion {
+                    category: "merge_files",
+                    priority: (cp.coupling_strength * 100.0) as u32,
+                    action: format!("Consider merging '{}' and '{}', or extracting shared logic", cp.file_a, cp.file_b),
+                    reason: format!(
+                        "These files change together in {:.0}% of commits ({} co-changes){}.  High change coupling + import coupling suggests they belong together.",
+                        cp.coupling_strength * 100.0,
+                        cp.co_change_count,
+                        if a_imports_b && b_imports_a { " with bidirectional imports" } else { "" }
+                    ),
+                    files: vec![cp.file_a.clone(), cp.file_b.clone()],
+                    estimated_impact: "Reduces logical coupling and simplifies change management".to_string(),
+                });
+            }
+        }
+    }
+
+    // ── 5. Resolve architectural inversions (upward violations) ──
+    let mut violation_counts: HashMap<String, u32> = HashMap::new();
+    for v in &arch.upward_violations {
+        if !in_scope(&v.from_file) { continue; }
+        *violation_counts.entry(v.from_file.clone()).or_default() += 1;
+    }
+    let mut worst_violators: Vec<(String, u32)> = violation_counts.into_iter().collect();
+    worst_violators.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (file, count) in worst_violators.iter().take(5) {
+        if *count < 2 { continue; }
+        let file_level = arch.levels.get(file.as_str()).copied().unwrap_or(0);
+        suggestions.push(Suggestion {
+            category: "fix_inversion",
+            priority: count.saturating_mul(20),
+            action: format!("Resolve {} upward dependency violations in '{}'", count, file),
+            reason: format!(
+                "This file (level {}) imports {} files from higher architecture levels. This creates hidden coupling and makes the dependency graph harder to reason about.",
+                file_level, count
+            ),
+            files: vec![file.clone()],
+            estimated_impact: format!("Eliminates {} architectural inversions", count),
+        });
+    }
+
+    // ── 6. Large files that should be split ──
+    for lf in &health.long_files {
+        if !in_scope(&lf.path) { continue; }
+        // Only suggest for really large files not already flagged as god files
+        if lf.value < 800 { continue; }
+        if health.god_files.iter().any(|g| g.path == lf.path) { continue; }
+
+        suggestions.push(Suggestion {
+            category: "split_file",
+            priority: (lf.value as u32 / 100).saturating_mul(10),
+            action: format!("Split '{}' ({} lines) into smaller modules", lf.path, lf.value),
+            reason: "Large files are harder to navigate, review, and test. Consider splitting by responsibility.".to_string(),
+            files: vec![lf.path.clone()],
+            estimated_impact: format!("Reduce file size from {} to ~{} lines per module", lf.value, lf.value / 3),
+        });
+    }
+
+    // Sort by priority (highest first) and truncate
+    suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+    suggestions.truncate(limit);
+
+    // Build category summary
+    let mut category_counts: HashMap<&str, usize> = HashMap::new();
+    for s in &suggestions {
+        *category_counts.entry(s.category).or_default() += 1;
+    }
+
+    let suggestions_json: Vec<Value> = suggestions.iter().enumerate().map(|(i, s)| {
+        json!({
+            "rank": i + 1,
+            "category": s.category,
+            "action": s.action,
+            "reason": s.reason,
+            "files": s.files,
+            "estimated_impact": s.estimated_impact
+        })
+    }).collect();
+
+    let mut result = json!({
+        "scope": scope.unwrap_or("(whole project)"),
+        "total_suggestions": suggestions_json.len(),
+        "categories": category_counts,
+        "suggestions": suggestions_json
+    });
+
+    if state.cached_evolution.is_none() {
+        result["note"] = json!("Run git_stats first to unlock merge/split suggestions based on change coupling patterns.");
+    }
+
+    Ok(result)
+}
