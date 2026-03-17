@@ -240,8 +240,9 @@ pub fn build_registry() -> registry::ToolRegistry {
     // Level 2 — Focus: "where should I look?" (use after health)
     reg.register(handlers_evo::top_files_def());
 
-    // Level 3 — File: "what exactly is wrong?" (use after top_files)
+    // Level 3 — File: "what exactly is wrong and what breaks?" (use after top_files)
     reg.register(handlers_evo::file_info_def());
+    reg.register(handlers_evo::impact_analysis_def());
 
     reg
 }

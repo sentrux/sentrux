@@ -11,7 +11,7 @@ use super::McpState;
 use super::registry::ToolDef;
 use crate::license::Tier;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Helpers (unchanged) ──
 
@@ -621,6 +621,189 @@ fn handle_top_files(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<
         "files_with_health_issues": issues_in_top,
         "out_of": ranked.len()
     });
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  IMPACT ANALYSIS — Transitive change impact for a file
+// ══════════════════════════════════════════════════════════════════
+
+pub fn impact_analysis_def() -> ToolDef {
+    ToolDef {
+        name: "impact_analysis",
+        description: "Transitive change impact for a single file — understand the cascade before refactoring. Returns: all direct and transitive dependents (full fan-in graph), blast radius as % of codebase, bidirectionally coupled files, and change-coupled files from git history. Change coupling data is available when git_stats has been called. Answers: 'if I restructure this file, what else breaks?'",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative file path as shown by scan" }
+            },
+            "required": ["path"]
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_impact_analysis,
+        invalidates_evolution: false,
+    }
+}
+
+fn handle_impact_analysis(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let raw_path = args.get("path").and_then(|p| p.as_str())
+        .ok_or("Missing 'path' argument")?;
+    let path = raw_path.trim().trim_start_matches("./");
+
+    // Verify the file exists in the scan
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let node = all_files.iter()
+        .find(|n| n.path == path || n.path.ends_with(&format!("/{path}")))
+        .ok_or_else(|| format!("File '{path}' not found in scan."))?;
+    let path = &node.path;
+
+    // Filter mod-declaration edges and include call_graph edges (consistent
+    // with compute_fan_maps and top_files). Deduplicate via seen set.
+    let mut all_nodes: HashSet<&str> = HashSet::new();
+    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut fwd_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut seen_edges: HashSet<(&str, &str)> = HashSet::new();
+    for edge in snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+    {
+        all_nodes.insert(edge.from_file.as_str());
+        all_nodes.insert(edge.to_file.as_str());
+        if seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            rev_adj.entry(edge.to_file.as_str()).or_default().push(edge.from_file.as_str());
+            fwd_adj.entry(edge.from_file.as_str()).or_default().push(edge.to_file.as_str());
+        }
+    }
+    for edge in &snap.call_graph {
+        all_nodes.insert(edge.from_file.as_str());
+        all_nodes.insert(edge.to_file.as_str());
+        if seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            rev_adj.entry(edge.to_file.as_str()).or_default().push(edge.from_file.as_str());
+            fwd_adj.entry(edge.from_file.as_str()).or_default().push(edge.to_file.as_str());
+        }
+    }
+
+    let total_files = all_nodes.len();
+
+    // ── 1. Direct dependents (fan-in) and dependencies (fan-out) ──
+    let direct_dependents: Vec<&str> = rev_adj.get(path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]).to_vec();
+    let direct_dependencies: Vec<&str> = fwd_adj.get(path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]).to_vec();
+
+    // ── 2. Transitive dependents via BFS on reverse graph ──
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    visited.insert(path.as_str());
+    queue.push_back(path.as_str());
+
+    let mut depth_map: HashMap<&str, u32> = HashMap::new();
+
+    while let Some(current) = queue.pop_front() {
+        let current_depth = depth_map.get(current).copied().unwrap_or(0);
+        if let Some(dependents) = rev_adj.get(current) {
+            for &dep in dependents {
+                if visited.insert(dep) {
+                    depth_map.insert(dep, current_depth + 1);
+                    queue.push_back(dep);
+                }
+            }
+        }
+    }
+
+    let transitive_count = visited.len() - 1;
+    let blast_pct = if total_files > 0 {
+        (transitive_count as f64 / total_files as f64 * 10000.0).round() as u32
+    } else { 0 };
+
+    let mut transitive_list: Vec<(&str, u32)> = depth_map.iter()
+        .map(|(&file, &depth)| (file, depth))
+        .collect();
+    transitive_list.sort_by(|(a_file, a_d), (b_file, b_d)| a_d.cmp(b_d).then_with(|| a_file.cmp(b_file)));
+
+    // ── 3. Bidirectionally coupled files (import in both directions) ──
+    // Files that both import and are imported by this file — the tightest coupling.
+    let dependent_set: HashSet<&str> = direct_dependents.iter().copied().collect();
+    let dependency_set: HashSet<&str> = direct_dependencies.iter().copied().collect();
+    let mut bidirectional_coupled: Vec<&str> = dependent_set.intersection(&dependency_set).copied().collect();
+    bidirectional_coupled.sort_unstable();
+
+    // ── 4. Change-coupled files from git history ──
+    let change_coupled: Vec<Value> = if let Some(evo) = state.cached_evolution.as_ref() {
+        evo.coupling_pairs.iter()
+            .filter(|cp| cp.file_a == path.as_str() || cp.file_b == path.as_str())
+            .map(|cp| {
+                let other = if cp.file_a == path.as_str() { &cp.file_b } else { &cp.file_a };
+                let is_import_coupled = dependent_set.contains(other.as_str())
+                    || dependency_set.contains(other.as_str());
+                json!({
+                    "file": other,
+                    "co_changes": cp.co_change_count,
+                    "strength": (cp.coupling_strength * 10000.0).round() as u32,
+                    "import_coupled": is_import_coupled
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // ── 5. Severity assessment ──
+    let severity = if blast_pct > 2500 {
+        "critical"
+    } else if blast_pct > 1000 {
+        "high"
+    } else if blast_pct > 500 {
+        "moderate"
+    } else {
+        "low"
+    };
+
+    let mut result = json!({
+        "path": path,
+        "severity": severity,
+        "direct_dependents": {
+            "count": direct_dependents.len(),
+            "files": direct_dependents
+        },
+        "direct_dependencies": {
+            "count": direct_dependencies.len(),
+            "files": direct_dependencies
+        },
+        "transitive_impact": {
+            "total_affected": transitive_count,
+            "blast_radius_pct": blast_pct,
+            "total_graph_files": total_files,
+            "files": transitive_list.iter().take(30).map(|(f, d)| json!({
+                "file": f,
+                "depth": d
+            })).collect::<Vec<_>>()
+        },
+        "bidirectional_coupled": {
+            "count": bidirectional_coupled.len(),
+            "files": bidirectional_coupled
+        },
+        "architecture": {
+            "level": arch.levels.get(path.as_str()),
+            "blast_radius": arch.blast_radius.get(path.as_str()),
+            "max_level": arch.max_level
+        }
+    });
+
+    if !change_coupled.is_empty() {
+        let hidden_deps: Vec<&Value> = change_coupled.iter()
+            .filter(|v| v.get("import_coupled").and_then(|b| b.as_bool()) == Some(false))
+            .collect();
+        result["change_coupling"] = json!({
+            "pairs": change_coupled,
+            "hidden_dependencies": hidden_deps.len()
+        });
+    } else if state.cached_evolution.is_none() {
+        result["change_coupling"] = json!({
+            "note": "Run git_stats first to see change-coupled files (co-change patterns not visible in import graph)"
+        });
+    }
 
     Ok(result)
 }
