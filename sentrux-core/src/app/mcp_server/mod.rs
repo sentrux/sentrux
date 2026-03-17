@@ -237,5 +237,8 @@ pub fn build_registry() -> registry::ToolRegistry {
     reg.register(handlers_evo::dsm_def());
     reg.register(handlers_evo::test_gaps_def());
 
+    // Level 3 — File: "what exactly is wrong?" (use after health flags a file)
+    reg.register(handlers_evo::file_info_def());
+
     reg
 }

@@ -3,9 +3,10 @@
 //!
 //! Same uniform signature as handlers.rs: `fn(&Value, &Tier, &mut McpState) -> Result<Value, String>`
 
-use crate::core::snapshot::Snapshot;
+use crate::core::snapshot::{self, Snapshot};
 use crate::core::types::FileNode;
 use crate::metrics::evolution;
+use crate::metrics::testgap;
 use super::McpState;
 use super::registry::ToolDef;
 use crate::license::Tier;
@@ -219,6 +220,233 @@ fn handle_test_gaps(args: &Value, tier: &Tier, state: &mut McpState) -> Result<V
         result["test_files_detail"] = json!(report.test_coverage.iter().take(10).map(|tc| json!({
             "test": tc.test_file, "covers": tc.covers
         })).collect::<Vec<_>>());
+    }
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  FILE INFO (Pro: per-file detailed analysis)
+// ══════════════════════════════════════════════════════════════════
+
+pub fn file_info_def() -> ToolDef {
+    ToolDef {
+        name: "file_info",
+        description: "Per-file deep dive — the most granular view of a single file. Shows: function-level complexity, coupling (fan-in/out, instability), architecture position (level, blast radius), git history (churn, authors, code age), and all detected issues. Git history fields are available when git_stats has been called.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative file path as shown by scan (e.g. 'src/app.rs')" }
+            },
+            "required": ["path"]
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_file_info,
+        invalidates_evolution: false,
+    }
+}
+
+fn handle_file_info(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let h = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let a = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let raw_path = args.get("path").and_then(|p| p.as_str())
+        .ok_or("Missing 'path' argument")?;
+    let path = raw_path.trim().trim_start_matches("./");
+
+    // ── 1. Find the FileNode ──
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let node = all_files.iter()
+        .find(|n| n.path == path || n.path.ends_with(&format!("/{path}")))
+        .ok_or_else(|| format!("File '{path}' not found in scan. Check the path is relative to the scanned root."))?;
+
+    // ── 2. Functions with per-function metrics ──
+    let mut functions_json: Vec<Value> = Vec::new();
+    if let Some(sa) = &node.sa {
+        if let Some(funcs) = &sa.functions {
+            let mut sorted: Vec<&crate::core::types::FuncInfo> = funcs.iter().collect();
+            // Sort by CC descending so worst functions come first
+            sorted.sort_by(|a, b| {
+                b.cc.unwrap_or(0).cmp(&a.cc.unwrap_or(0))
+            });
+            for f in &sorted {
+                functions_json.push(json!({
+                    "name": f.n,
+                    "lines": f.ln,
+                    "cc": f.cc,
+                    "cognitive": f.cog,
+                    "params": f.pc,
+                    "is_public": f.is_public
+                }));
+            }
+        }
+    }
+
+    // ── 3. Coupling from import_graph + call_graph ──
+    // Filter mod-declaration edges and deduplicate import+call edges,
+    // consistent with compute_fan_maps() in metrics/mod.rs.
+    let mut imports: Vec<&str> = Vec::new();
+    let mut imported_by: Vec<&str> = Vec::new();
+    let mut seen_edges: HashSet<(&str, &str)> = HashSet::new();
+    for edge in snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+    {
+        if !seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            continue;
+        }
+        if edge.from_file == path {
+            imports.push(&edge.to_file);
+        }
+        if edge.to_file == path {
+            imported_by.push(&edge.from_file);
+        }
+    }
+    for edge in &snap.call_graph {
+        if !seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            continue;
+        }
+        if edge.from_file == path {
+            imports.push(&edge.to_file);
+        }
+        if edge.to_file == path {
+            imported_by.push(&edge.from_file);
+        }
+    }
+    let fan_in = imported_by.len();
+    let fan_out = imports.len();
+    let instability = if fan_in + fan_out > 0 {
+        fan_out as f64 / (fan_in + fan_out) as f64
+    } else {
+        0.0
+    };
+
+    // ── 4. Issues from HealthReport ──
+    let is_god_file = h.god_files.iter().any(|f| f.path == path);
+    let is_hotspot = h.hotspot_files.iter().any(|f| f.path == path);
+    let in_cycle = h.circular_dep_files.iter().any(|cycle| cycle.contains(&path.to_string()));
+    let is_large_file = h.long_files.iter().any(|f| f.path == path);
+    let complex_fns = h.complex_functions.iter().filter(|f| f.file == path).count();
+    let long_fns = h.long_functions.iter().filter(|f| f.file == path).count();
+    let cog_complex_fns = h.cog_complex_functions.iter().filter(|f| f.file == path).count();
+    let high_param_fns = h.high_param_functions.iter().filter(|f| f.file == path).count();
+    let dead_fns = h.dead_functions.iter().filter(|f| f.file == path).count();
+    let duplicate_fns = h.duplicate_groups.iter()
+        .flat_map(|g| &g.instances)
+        .filter(|(f, _, _)| f == path)
+        .count();
+
+    // ── 5. Build issues summary ──
+    let mut issue_parts: Vec<String> = Vec::new();
+    if is_god_file { issue_parts.push("god file (high fan-out)".into()); }
+    if is_hotspot { issue_parts.push("hotspot (high fan-in + unstable)".into()); }
+    if is_large_file { issue_parts.push(format!("large file (>{} lines)", node.lines)); }
+    if in_cycle { issue_parts.push("in circular dependency".into()); }
+    if complex_fns > 0 { issue_parts.push(format!("{complex_fns} complex function(s)")); }
+    if long_fns > 0 { issue_parts.push(format!("{long_fns} long function(s)")); }
+    if cog_complex_fns > 0 { issue_parts.push(format!("{cog_complex_fns} cognitively complex function(s)")); }
+    if high_param_fns > 0 { issue_parts.push(format!("{high_param_fns} high-param function(s)")); }
+    if dead_fns > 0 { issue_parts.push(format!("{dead_fns} dead function(s)")); }
+    if duplicate_fns > 0 { issue_parts.push(format!("{duplicate_fns} duplicate function(s)")); }
+
+    let summary = if issue_parts.is_empty() {
+        "No issues detected.".to_string()
+    } else {
+        format!("{} issue(s): {}", issue_parts.len(), issue_parts.join(", "))
+    };
+
+    // ── 6. Assemble result ──
+    let is_test = testgap::is_test_file(path);
+    let is_entry_point = snap.entry_points.iter().any(|ep| ep.file == path);
+
+    let mut result = json!({
+        "path": path,
+        "lang": node.lang,
+        "is_test": is_test,
+        "is_entry_point": is_entry_point,
+        "lines": {
+            "total": node.lines,
+            "logic": node.logic,
+            "comments": node.comments,
+            "blanks": node.blanks
+        },
+        "functions": {
+            "count": node.funcs,
+            "details": functions_json
+        },
+        "dependencies": {
+            "fan_in": fan_in,
+            "fan_out": fan_out,
+            "instability": (instability * 10000.0).round() as u32,
+            "imports": imports,
+            "imported_by": imported_by
+        },
+        "architecture": {
+            "level": a.levels.get(path),
+            "max_level": a.max_level,
+            "blast_radius": a.blast_radius.get(path),
+            "exec_depth": snap.exec_depth.get(path)
+        },
+        "issues": {
+            "is_god_file": is_god_file,
+            "is_hotspot": is_hotspot,
+            "is_large_file": is_large_file,
+            "in_cycle": in_cycle,
+            "complex_functions": complex_fns,
+            "long_functions": long_fns,
+            "cog_complex_functions": cog_complex_fns,
+            "high_param_functions": high_param_fns,
+            "dead_functions": dead_fns,
+            "duplicate_functions": duplicate_fns
+        },
+        "summary": summary
+    });
+
+    // ── 7. Git history (if evolution data was computed via git_stats) ──
+    if let Some(evo) = state.cached_evolution.as_ref() {
+        let mut git = json!({});
+        if let Some(churn) = evo.churn.get(path) {
+            git["churn"] = json!({
+                "commits": churn.commit_count,
+                "lines_added": churn.lines_added,
+                "lines_removed": churn.lines_removed,
+                "total_churn": churn.total_churn
+            });
+        }
+        if let Some(&age) = evo.code_age.get(path) {
+            git["code_age_days"] = json!(age);
+        }
+        if let Some(author) = evo.authors.get(path) {
+            git["authors"] = json!({
+                "count": author.author_count,
+                "primary": author.primary_author,
+                "primary_ratio": (author.primary_ratio * 10000.0).round() as u32,
+                "all": author.authors
+            });
+        }
+        if let Some(hotspot) = evo.hotspots.iter().find(|h| h.file == path) {
+            git["temporal_hotspot"] = json!({
+                "risk_score": hotspot.risk_score,
+                "churn": hotspot.churn_count,
+                "complexity": hotspot.max_complexity
+            });
+        }
+        // Coupling pairs involving this file
+        let coupling: Vec<Value> = evo.coupling_pairs.iter()
+            .filter(|cp| cp.file_a == path || cp.file_b == path)
+            .map(|cp| {
+                let other = if cp.file_a == path { &cp.file_b } else { &cp.file_a };
+                json!({
+                    "coupled_with": other,
+                    "co_changes": cp.co_change_count,
+                    "strength": (cp.coupling_strength * 10000.0).round() as u32
+                })
+            })
+            .collect();
+        if !coupling.is_empty() {
+            git["change_coupling"] = json!(coupling);
+        }
+        result["git_history"] = git;
     }
 
     Ok(result)
