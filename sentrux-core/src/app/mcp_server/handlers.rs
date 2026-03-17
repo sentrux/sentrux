@@ -94,7 +94,7 @@ fn handle_scan(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value
 pub fn health_def() -> ToolDef {
     ToolDef {
         name: "health",
-        description: "Get quality signal (0-1) with root cause breakdown (modularity, acyclicity, depth, equality, redundancy). Quality signal = geometric mean — maximize this ONE number.",
+        description: "Get quality signal (0–10000 scale, higher is better) with root cause breakdown (modularity, acyclicity, depth, equality, redundancy). Quality signal = geometric mean of root cause scores — maximize this ONE number.",
         input_schema: json!({ "type": "object", "properties": {} }),
         min_tier: Tier::Free,
         handler: handle_health,
@@ -180,7 +180,7 @@ fn handle_health(_args: &Value, tier: &Tier, state: &mut McpState) -> Result<Val
 pub fn session_start_def() -> ToolDef {
     ToolDef {
         name: "session_start",
-        description: "Save current health metrics as baseline for later comparison via 'gate' or 'session_end'.",
+        description: "Save current health metrics as baseline for later comparison via 'session_end'.",
         input_schema: json!({ "type": "object", "properties": {} }),
         min_tier: Tier::Free,
         handler: handle_session_start,
@@ -281,7 +281,7 @@ fn handle_rescan(_args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Va
 pub fn check_rules_def() -> ToolDef {
     ToolDef {
         name: "check_rules",
-        description: "Check .sentrux/rules.toml architectural constraints. Returns pass/fail with specific violations.",
+        description: "Check .sentrux/rules.toml architectural constraints against current scan data. Returns pass/fail with specific violations. Standalone — does not depend on health or git_stats.",
         input_schema: json!({ "type": "object", "properties": {} }),
         min_tier: Tier::Free,
         handler: handle_check_rules,

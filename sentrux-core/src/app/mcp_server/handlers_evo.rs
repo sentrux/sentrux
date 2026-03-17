@@ -62,7 +62,7 @@ fn collect_files(node: &FileNode, set: &mut HashSet<String>) {
 pub fn evolution_def() -> ToolDef {
     ToolDef {
         name: "git_stats",
-        description: "Git history analysis: code churn, hotspots (churn x complexity), bus factor, change coupling. Raw data — not a score. Requires git history.",
+        description: "Git history analysis: code churn, hotspots (churn x complexity), bus factor, change coupling. Enriches top_files (churn/risk metrics), suggest_refactoring (merge suggestions), impact_analysis (change coupling), and file_info (per-file git history). Requires a git repository.",
         input_schema: json!({
             "type": "object",
             "properties": {
