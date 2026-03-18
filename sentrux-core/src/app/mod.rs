@@ -63,4 +63,6 @@ pub struct SentruxApp {
     pub(crate) layout_handle: Option<std::thread::JoinHandle<()>>,
     /// Receives folder path from the background file picker dialog
     pub(crate) folder_picker_rx: Option<crossbeam_channel::Receiver<Option<String>>>,
+    /// Platform pixels-per-point before any ui_scale is applied (captured at startup)
+    pub(crate) native_ppp: f32,
 }
