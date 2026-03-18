@@ -108,7 +108,6 @@ jobs:
 
   release:
     needs: build
-    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
