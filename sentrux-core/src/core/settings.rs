@@ -181,8 +181,8 @@ impl Default for Settings {
             blueprint_gutter_top: 14.0,
             blueprint_route_margin: 40.0,
 
-            font_scale: 0.10,
-            ui_scale: 1.0,
+            font_scale: 0.20,
+            ui_scale: 1.50,
 
             zoom_min: 0.05,
             zoom_max: 50.0,

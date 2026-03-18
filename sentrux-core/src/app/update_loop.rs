@@ -28,12 +28,16 @@ impl SentruxApp {
             state.root_path = Some(path);
         }
 
+        // Capture native ppp before any scaling so we can recompute correctly when
+        // the ui_scale slider changes at runtime.
+        let native_ppp = ctx.pixels_per_point();
+
         // Load fonts after prefs so load_cjk_fonts setting is respected.
         // Also check SENTRUX_NO_CJK env var as an override.
         let load_cjk = state.settings.load_cjk_fonts
             && std::env::var("SENTRUX_NO_CJK").is_err();
         setup_fonts(ctx, load_cjk);
-        setup_style(ctx, state.settings.ui_scale);
+        setup_style(ctx, native_ppp, state.settings.ui_scale);
 
         let (scan_cmd_tx, scan_cmd_rx) = bounded::<ScanCommand>(1);
         let (scan_msg_tx, scan_msg_rx) = bounded::<ScanMsg>(64);
@@ -62,6 +66,7 @@ impl SentruxApp {
             scanner_handle: Some(scanner_handle),
             layout_handle: Some(layout_handle),
             folder_picker_rx: None,
+            native_ppp,
         }
     }
 }
@@ -106,6 +111,9 @@ impl eframe::App for SentruxApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Re-apply ui_scale every frame so the settings slider takes effect immediately.
+        ctx.set_pixels_per_point(self.native_ppp * self.state.settings.ui_scale);
+
         // Global keyboard shortcuts
         ctx.input(|i| {
             // Cmd+R: rescan
@@ -304,29 +312,28 @@ impl SentruxApp {
 fn setup_fonts(ctx: &egui::Context, load_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Embed Terminus — the classic bitmap terminal font (1981 aesthetic).
-    // Hand-tuned pixel-by-pixel for maximum readability at small sizes.
-    let terminus_data = include_bytes!("../../assets/fonts/terminus.ttf");
-    let terminus_bold_data = include_bytes!("../../assets/fonts/terminus-bold.ttf");
+    // Embed JetBrains Mono — clean, readable monospace font.
+    let jbmono_data = include_bytes!("../../assets/fonts/jetbrains-mono.ttf");
+    let jbmono_bold_data = include_bytes!("../../assets/fonts/jetbrains-mono-bold.ttf");
 
     fonts.font_data.insert(
-        "terminus".to_string(),
-        egui::FontData::from_static(terminus_data).into(),
+        "jetbrains_mono".to_string(),
+        egui::FontData::from_static(jbmono_data).into(),
     );
     fonts.font_data.insert(
-        "terminus_bold".to_string(),
-        egui::FontData::from_static(terminus_bold_data).into(),
+        "jetbrains_mono_bold".to_string(),
+        egui::FontData::from_static(jbmono_bold_data).into(),
     );
 
-    // Terminus as PRIMARY monospace font (before egui defaults)
+    // JetBrains Mono as PRIMARY monospace font (before egui defaults)
     fonts.families.entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "terminus".to_string());
+        .insert(0, "jetbrains_mono".to_string());
 
     // Also use for proportional (everything should be monospace in our app)
     fonts.families.entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "terminus".to_string());
+        .insert(0, "jetbrains_mono".to_string());
 
     if load_cjk {
         let cjk_paths = [
@@ -366,11 +373,10 @@ fn setup_fonts(ctx: &egui::Context, load_cjk: bool) {
     ctx.set_fonts(fonts);
 }
 
-fn setup_style(ctx: &egui::Context, ui_scale: f32) {
+fn setup_style(ctx: &egui::Context, native_ppp: f32, ui_scale: f32) {
     // Scale ALL UI (text + widgets) uniformly via pixels_per_point.
-    // This affects both text styles AND hardcoded FontId sizes in panels.
-    let base_ppp = ctx.pixels_per_point();
-    ctx.set_pixels_per_point(base_ppp * ui_scale);
+    // Use native_ppp (pre-scaling baseline) so we multiply once, not repeatedly.
+    ctx.set_pixels_per_point(native_ppp * ui_scale);
 
     let mut style = (*ctx.style()).clone();
     style.text_styles.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Monospace));
