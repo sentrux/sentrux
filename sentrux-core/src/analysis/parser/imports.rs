@@ -47,10 +47,10 @@ pub(crate) fn normalize_module_path(raw: &str, dots_are_separators: bool) -> Str
         ("", s)
     };
 
-    // Always convert '::' → '/' (Rust paths).
+    // Always convert '::' → '/' (Rust paths) and '\' → '/' (PHP namespaces).
     // Convert '.' → '/' only when the language uses dots as module separators.
     // File-path languages (C, HTML, CSS) keep dots as-is (they're file extensions).
-    let mut normalized = rest.replace("::", "/");
+    let mut normalized = rest.replace("::", "/").replace('\\', "/");
     if dots_are_separators && !normalized.contains('/') && rest.contains('.') {
         // Only convert dots when no slashes present (avoids mangling file paths
         // that were already slash-separated by the :: conversion).
@@ -418,6 +418,21 @@ mod tests {
     fn normalize_relative() {
         assert_eq!(normalize_module_path("..utils", true), "..utils");
         assert_eq!(normalize_module_path("...deep.path", true), "...deep/path");
+    }
+
+    #[test]
+    fn normalize_php_backslash() {
+        // PHP namespace imports use backslashes: App\Entity\User
+        assert_eq!(normalize_module_path("App\\Entity\\User", true), "App/Entity/User");
+        assert_eq!(normalize_module_path("App\\Entity\\User", false), "App/Entity/User");
+    }
+
+    #[test]
+    fn normalize_php_deeply_nested() {
+        assert_eq!(
+            normalize_module_path("App\\GraphQL\\Resolver\\Admin\\PermissionRequestResolver", true),
+            "App/GraphQL/Resolver/Admin/PermissionRequestResolver"
+        );
     }
 }
 

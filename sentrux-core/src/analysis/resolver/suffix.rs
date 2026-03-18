@@ -369,7 +369,13 @@ fn build_module_suffix_index<'a>(known_files: &HashSet<&'a str>, scan_root: &Pat
 
     // Module prefix files: parse files like go.mod to map module paths to project dirs.
     // Reads module_prefix_file and module_prefix_directive from plugin TOML.
-    let module_prefixes = collect_module_prefixes(project_map, scan_root);
+    let mut module_prefixes = collect_module_prefixes(project_map, scan_root);
+
+    // PSR-4 autoload prefixes from composer.json (PHP namespace → directory mappings).
+    collect_psr4_prefixes(&mut module_prefixes, project_map, scan_root);
+
+    // Re-sort after PSR-4 additions: longest prefix first for greedy matching.
+    module_prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
     // Manifest name → entry point (separate map for safe single-segment lookup)
     let mut manifest_name_aliases: HashMap<String, Vec<&'a str>> = HashMap::new();
@@ -432,6 +438,93 @@ fn collect_module_prefixes(project_map: &HashMap<String, String>, scan_root: &Pa
     // Sort longest module path first for greedy matching
     prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     prefixes
+}
+
+/// Scan project roots for composer.json files and extract PSR-4 autoload mappings.
+/// Maps PHP namespace prefixes to source directories so that `App\Entity\User`
+/// (normalized to `App/Entity/User`) can be stripped to `src/Entity/User`.
+fn collect_psr4_prefixes(
+    prefixes: &mut Vec<(String, String)>,
+    project_map: &HashMap<String, String>,
+    scan_root: &Path,
+) {
+    let unique_roots: HashSet<&str> = project_map.values().map(|s| s.as_str()).collect();
+
+    for &project_dir in &unique_roots {
+        let composer_path = if project_dir.is_empty() {
+            scan_root.join("composer.json")
+        } else {
+            scan_root.join(project_dir).join("composer.json")
+        };
+
+        let content = match std::fs::read_to_string(&composer_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Minimal JSON parsing for autoload.psr-4 without pulling in serde_json.
+        // We look for "psr-4" key inside "autoload" and extract "Namespace\\": "dir/" pairs.
+        if let Some(mappings) = extract_psr4_mappings(&content) {
+            for (namespace, dir) in mappings {
+                // namespace comes as "App/" (already slash-normalized from "App\\")
+                // dir comes as "src/" — prepend project_dir if non-empty
+                let full_dir = if project_dir.is_empty() {
+                    dir
+                } else {
+                    format!("{}/{}", project_dir, dir)
+                };
+                prefixes.push((namespace, full_dir));
+            }
+        }
+    }
+}
+
+/// Extract PSR-4 namespace→directory mappings from composer.json content.
+/// Returns Vec of (namespace_prefix, source_dir) where namespace uses forward slashes.
+/// Example: ("App/", "src/") from {"autoload": {"psr-4": {"App\\": "src/"}}}
+fn extract_psr4_mappings(content: &str) -> Option<Vec<(String, String)>> {
+    let json: serde_json::Value = serde_json::from_str(content).ok()?;
+    let psr4 = json.get("autoload")?.get("psr-4")?.as_object()?;
+
+    let mut mappings = Vec::new();
+    for (namespace_raw, dir_val) in psr4 {
+        // Normalize namespace: "App\\" → "App/"
+        let namespace = namespace_raw.replace('\\', "/");
+
+        // Value can be a string ("src/") or array (["src/", "lib/"])
+        let dirs: Vec<&str> = match dir_val {
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+            _ => continue,
+        };
+
+        for dir_raw in dirs {
+            let dir = dir_raw.trim_end_matches('/').to_string();
+            if !namespace.is_empty() && !dir.is_empty() {
+                mappings.push((namespace.clone(), dir));
+            }
+        }
+    }
+
+    // Also check autoload-dev for test namespace mappings
+    if let Some(psr4_dev) = json.get("autoload-dev").and_then(|a| a.get("psr-4")).and_then(|p| p.as_object()) {
+        for (namespace_raw, dir_val) in psr4_dev {
+            let namespace = namespace_raw.replace('\\', "/");
+            let dirs: Vec<&str> = match dir_val {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+                _ => continue,
+            };
+            for dir_raw in dirs {
+                let dir = dir_raw.trim_end_matches('/').to_string();
+                if !namespace.is_empty() && !dir.is_empty() {
+                    mappings.push((namespace.clone(), dir));
+                }
+            }
+        }
+    }
+
+    if mappings.is_empty() { None } else { Some(mappings) }
 }
 
 /// Add exact package name → entry file to the manifest_name_aliases map.
@@ -901,4 +994,49 @@ fn navigate_json<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a ser
     let mut current = value;
     for key in path.split('.') { current = current.get(key)?; }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn psr4_basic_mapping() {
+        let content = r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#;
+        let mappings = extract_psr4_mappings(content).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].0, "App/");
+        assert_eq!(mappings[0].1, "src");
+    }
+
+    #[test]
+    fn psr4_multiple_namespaces() {
+        let content = r#"{"autoload":{"psr-4":{"App\\":"src/","Vendor\\Lib\\":"lib/"}}}"#;
+        let mappings = extract_psr4_mappings(content).unwrap();
+        assert_eq!(mappings.len(), 2);
+    }
+
+    #[test]
+    fn psr4_with_autoload_dev() {
+        let content = r#"{"autoload":{"psr-4":{"App\\":"src/"}},"autoload-dev":{"psr-4":{"App\\Tests\\":"tests/"}}}"#;
+        let mappings = extract_psr4_mappings(content).unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[1].0, "App/Tests/");
+        assert_eq!(mappings[1].1, "tests");
+    }
+
+    #[test]
+    fn psr4_no_autoload() {
+        let content = r#"{"name":"my/package"}"#;
+        assert!(extract_psr4_mappings(content).is_none());
+    }
+
+    #[test]
+    fn psr4_array_dirs() {
+        let content = r#"{"autoload":{"psr-4":{"App\\":["src/","lib/"]}}}"#;
+        let mappings = extract_psr4_mappings(content).unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0].1, "src");
+        assert_eq!(mappings[1].1, "lib");
+    }
 }
