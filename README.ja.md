@@ -200,7 +200,26 @@ Agent: session_end()
       summary: "Quality degraded during this session" }
 ```
 
-9ツール：`scan` · `health` · `session_start` · `session_end` · `rescan` · `check_rules` · `evolution` · `dsm` · `test_gaps`
+**分析・リファクタリングツール**
+
+```
+Agent: top_files(metric="risk", limit=3)
+  → { files: [{ path: "src/db/conn.rs", risk_score: 87400, fan_in: 20, churn: 19 }, ...] }
+
+Agent: file_info(path="src/db/conn.rs")
+  → { functions: [...], dependencies: { fan_in: 20, fan_out: 3, instability: 1300 },
+      issues: { is_hotspot: true, complex_functions: 2 }, git_history: { churn: {...} } }
+
+Agent: impact_analysis(path="src/db/conn.rs")
+  → { severity: "critical", transitive_impact: { total_affected: 46, blast_radius_pct: 4600 },
+      bidirectional_coupled: { count: 1 }, change_coupling: { pairs: [...] } }
+
+Agent: suggest_refactoring(scope="src/db")
+  → { suggestions: [{ category: "split_file", action: "Split 'src/db/conn.rs' into ...",
+       reason: "God file: fan-out=12, 8 functions", estimated_impact: "..." }] }
+```
+
+13ツール：`scan` · `health` · `session_start` · `session_end` · `rescan` · `check_rules` · `git_stats` · `dsm` · `test_gaps` · `top_files` · `file_info` · `impact_analysis` · `suggest_refactoring`
 
 ## ルールエンジン
 

@@ -3,14 +3,15 @@
 //!
 //! Same uniform signature as handlers.rs: `fn(&Value, &Tier, &mut McpState) -> Result<Value, String>`
 
-use crate::core::snapshot::Snapshot;
-use crate::core::types::FileNode;
+use crate::core::snapshot::{self, Snapshot};
+use crate::core::types::{FileNode, ImportEdge};
 use crate::metrics::evolution;
+use crate::metrics::testgap;
 use super::McpState;
 use super::registry::ToolDef;
 use crate::license::Tier;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Helpers (unchanged) ──
 
@@ -62,7 +63,7 @@ fn collect_files(node: &FileNode, set: &mut HashSet<String>) {
 pub fn evolution_def() -> ToolDef {
     ToolDef {
         name: "git_stats",
-        description: "Git history analysis: code churn, hotspots (churn x complexity), bus factor, change coupling. Raw data — not a score. Requires git history.",
+        description: "Git history analysis: code churn, hotspots (churn x complexity), bus factor, change coupling. Enriches top_files (churn/risk metrics), suggest_refactoring (merge suggestions), impact_analysis (change coupling), and file_info (per-file git history). Requires a git repository.",
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -219,6 +220,842 @@ fn handle_test_gaps(args: &Value, tier: &Tier, state: &mut McpState) -> Result<V
         result["test_files_detail"] = json!(report.test_coverage.iter().take(10).map(|tc| json!({
             "test": tc.test_file, "covers": tc.covers
         })).collect::<Vec<_>>());
+    }
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  FILE INFO (Pro: per-file detailed analysis)
+// ══════════════════════════════════════════════════════════════════
+
+pub fn file_info_def() -> ToolDef {
+    ToolDef {
+        name: "file_info",
+        description: "Per-file deep dive — the most granular view of a single file. Shows: function-level complexity, coupling (fan-in/out, instability), architecture position (level, blast radius), git history (churn, authors, code age), and all detected issues. Git history fields are available when git_stats has been called.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative file path as shown by scan (e.g. 'src/app.rs')" }
+            },
+            "required": ["path"]
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_file_info,
+        invalidates_evolution: false,
+    }
+}
+
+fn handle_file_info(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let h = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let a = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let raw_path = args.get("path").and_then(|p| p.as_str())
+        .ok_or("Missing 'path' argument")?;
+    let path = raw_path.trim().trim_start_matches("./");
+
+    // ── 1. Find the FileNode ──
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let node = all_files.iter()
+        .find(|n| n.path == path || n.path.ends_with(&format!("/{path}")))
+        .ok_or_else(|| format!("File '{path}' not found in scan. Check the path is relative to the scanned root."))?;
+
+    // ── 2. Functions with per-function metrics ──
+    let mut functions_json: Vec<Value> = Vec::new();
+    if let Some(sa) = &node.sa {
+        if let Some(funcs) = &sa.functions {
+            let mut sorted: Vec<&crate::core::types::FuncInfo> = funcs.iter().collect();
+            // Sort by CC descending so worst functions come first
+            sorted.sort_by(|a, b| {
+                b.cc.unwrap_or(0).cmp(&a.cc.unwrap_or(0))
+            });
+            for f in &sorted {
+                functions_json.push(json!({
+                    "name": f.n,
+                    "lines": f.ln,
+                    "cc": f.cc,
+                    "cognitive": f.cog,
+                    "params": f.pc,
+                    "is_public": f.is_public
+                }));
+            }
+        }
+    }
+
+    // ── 3. Coupling from import_graph + call_graph ──
+    // Filter mod-declaration edges and deduplicate import+call edges,
+    // consistent with compute_fan_maps() in metrics/mod.rs.
+    let mut imports: Vec<&str> = Vec::new();
+    let mut imported_by: Vec<&str> = Vec::new();
+    let mut seen_edges: HashSet<(&str, &str)> = HashSet::new();
+    for edge in snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+    {
+        if !seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            continue;
+        }
+        if edge.from_file == path {
+            imports.push(&edge.to_file);
+        }
+        if edge.to_file == path {
+            imported_by.push(&edge.from_file);
+        }
+    }
+    for edge in &snap.call_graph {
+        if !seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            continue;
+        }
+        if edge.from_file == path {
+            imports.push(&edge.to_file);
+        }
+        if edge.to_file == path {
+            imported_by.push(&edge.from_file);
+        }
+    }
+    let fan_in = imported_by.len();
+    let fan_out = imports.len();
+    let instability = if fan_in + fan_out > 0 {
+        fan_out as f64 / (fan_in + fan_out) as f64
+    } else {
+        0.0
+    };
+
+    // ── 4. Issues from HealthReport ──
+    let is_god_file = h.god_files.iter().any(|f| f.path == path);
+    let is_hotspot = h.hotspot_files.iter().any(|f| f.path == path);
+    let in_cycle = h.circular_dep_files.iter().any(|cycle| cycle.contains(&path.to_string()));
+    let is_large_file = h.long_files.iter().any(|f| f.path == path);
+    let complex_fns = h.complex_functions.iter().filter(|f| f.file == path).count();
+    let long_fns = h.long_functions.iter().filter(|f| f.file == path).count();
+    let cog_complex_fns = h.cog_complex_functions.iter().filter(|f| f.file == path).count();
+    let high_param_fns = h.high_param_functions.iter().filter(|f| f.file == path).count();
+    let dead_fns = h.dead_functions.iter().filter(|f| f.file == path).count();
+    let duplicate_fns = h.duplicate_groups.iter()
+        .flat_map(|g| &g.instances)
+        .filter(|(f, _, _)| f == path)
+        .count();
+
+    // ── 5. Build issues summary ──
+    let mut issue_parts: Vec<String> = Vec::new();
+    if is_god_file { issue_parts.push("god file (high fan-out)".into()); }
+    if is_hotspot { issue_parts.push("hotspot (high fan-in + unstable)".into()); }
+    if is_large_file { issue_parts.push(format!("large file (>{} lines)", node.lines)); }
+    if in_cycle { issue_parts.push("in circular dependency".into()); }
+    if complex_fns > 0 { issue_parts.push(format!("{complex_fns} complex function(s)")); }
+    if long_fns > 0 { issue_parts.push(format!("{long_fns} long function(s)")); }
+    if cog_complex_fns > 0 { issue_parts.push(format!("{cog_complex_fns} cognitively complex function(s)")); }
+    if high_param_fns > 0 { issue_parts.push(format!("{high_param_fns} high-param function(s)")); }
+    if dead_fns > 0 { issue_parts.push(format!("{dead_fns} dead function(s)")); }
+    if duplicate_fns > 0 { issue_parts.push(format!("{duplicate_fns} duplicate function(s)")); }
+
+    let summary = if issue_parts.is_empty() {
+        "No issues detected.".to_string()
+    } else {
+        format!("{} issue(s): {}", issue_parts.len(), issue_parts.join(", "))
+    };
+
+    // ── 6. Assemble result ──
+    let is_test = testgap::is_test_file(path);
+    let is_entry_point = snap.entry_points.iter().any(|ep| ep.file == path);
+
+    let mut result = json!({
+        "path": path,
+        "lang": node.lang,
+        "is_test": is_test,
+        "is_entry_point": is_entry_point,
+        "lines": {
+            "total": node.lines,
+            "logic": node.logic,
+            "comments": node.comments,
+            "blanks": node.blanks
+        },
+        "functions": {
+            "count": node.funcs,
+            "details": functions_json
+        },
+        "dependencies": {
+            "fan_in": fan_in,
+            "fan_out": fan_out,
+            "instability": (instability * 10000.0).round() as u32,
+            "imports": imports,
+            "imported_by": imported_by
+        },
+        "architecture": {
+            "level": a.levels.get(path),
+            "max_level": a.max_level,
+            "blast_radius": a.blast_radius.get(path),
+            "exec_depth": snap.exec_depth.get(path)
+        },
+        "issues": {
+            "is_god_file": is_god_file,
+            "is_hotspot": is_hotspot,
+            "is_large_file": is_large_file,
+            "in_cycle": in_cycle,
+            "complex_functions": complex_fns,
+            "long_functions": long_fns,
+            "cog_complex_functions": cog_complex_fns,
+            "high_param_functions": high_param_fns,
+            "dead_functions": dead_fns,
+            "duplicate_functions": duplicate_fns
+        },
+        "summary": summary
+    });
+
+    // ── 7. Git history (if evolution data was computed via git_stats) ──
+    if let Some(evo) = state.cached_evolution.as_ref() {
+        let mut git = json!({});
+        if let Some(churn) = evo.churn.get(path) {
+            git["churn"] = json!({
+                "commits": churn.commit_count,
+                "lines_added": churn.lines_added,
+                "lines_removed": churn.lines_removed,
+                "total_churn": churn.total_churn
+            });
+        }
+        if let Some(&age) = evo.code_age.get(path) {
+            git["code_age_days"] = json!(age);
+        }
+        if let Some(author) = evo.authors.get(path) {
+            git["authors"] = json!({
+                "count": author.author_count,
+                "primary": author.primary_author,
+                "primary_ratio": (author.primary_ratio * 10000.0).round() as u32,
+                "all": author.authors
+            });
+        }
+        if let Some(hotspot) = evo.hotspots.iter().find(|h| h.file == path) {
+            git["temporal_hotspot"] = json!({
+                "risk_score": hotspot.risk_score,
+                "churn": hotspot.churn_count,
+                "complexity": hotspot.max_complexity
+            });
+        }
+        // Coupling pairs involving this file
+        let coupling: Vec<Value> = evo.coupling_pairs.iter()
+            .filter(|cp| cp.file_a == path || cp.file_b == path)
+            .map(|cp| {
+                let other = if cp.file_a == path { &cp.file_b } else { &cp.file_a };
+                json!({
+                    "coupled_with": other,
+                    "co_changes": cp.co_change_count,
+                    "strength": (cp.coupling_strength * 10000.0).round() as u32
+                })
+            })
+            .collect();
+        if !coupling.is_empty() {
+            git["change_coupling"] = json!(coupling);
+        }
+        result["git_history"] = git;
+    }
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  TOP FILES — Ranked file listing by metric
+// ══════════════════════════════════════════════════════════════════
+
+pub fn top_files_def() -> ToolDef {
+    ToolDef {
+        name: "top_files",
+        description: "Ranked file listing by a chosen metric — the middle layer between 'health' (project-level) and 'file_info' (single file). Unlike health's per-root-cause lists, this provides a unified cross-metric ranking. Metrics: 'coupling' (fan-in + fan-out), 'fan_in', 'fan_out', 'complexity' (max cyclomatic), 'cognitive' (max cognitive), 'instability', 'blast_radius', 'churn', 'risk' (churn × complexity × coupling composite). Churn/risk metrics are more accurate when git_stats has been called.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "metric": {
+                    "type": "string",
+                    "description": "Metric to rank by: coupling, fan_in, fan_out, complexity, cognitive, instability, blast_radius, churn, risk (default: risk)",
+                    "enum": ["coupling", "fan_in", "fan_out", "complexity", "cognitive", "instability", "blast_radius", "churn", "risk"]
+                },
+                "limit": { "type": "integer", "description": "Number of files to return (default 10, max 50)" }
+            }
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_top_files,
+        invalidates_evolution: false,
+    }
+}
+
+/// Per-file aggregated data for ranking.
+struct FileRankData {
+    path: String,
+    fan_in: usize,
+    fan_out: usize,
+    max_cc: u32,
+    max_cog: u32,
+    instability: f64,
+    blast_radius: u32,
+    churn: u32,
+    lines: u32,
+    risk_score: f64,
+}
+
+fn handle_top_files(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let health = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let metric = args.get("metric").and_then(|m| m.as_str()).unwrap_or("risk");
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10).min(50) as usize;
+
+    // Reuse the canonical fan-map computation from metrics (filters mod-declaration
+    // edges, deduplicates import+call edges). Keyed by owned String.
+    let dep_edges: Vec<ImportEdge> = snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+        .cloned()
+        .collect();
+    let (fan_out_map, fan_in_map) = crate::metrics::compute_fan_maps(&dep_edges, &snap.call_graph);
+
+    // Build per-file data
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let churn_map = state.cached_evolution.as_ref().map(|e| &e.churn);
+
+    let mut ranked: Vec<FileRankData> = all_files.iter()
+        .filter(|f| !f.lang.is_empty() && f.lang != "unknown")
+        .filter(|f| !testgap::is_test_file(&f.path))
+        .map(|f| {
+            let fi = fan_in_map.get(f.path.as_str()).copied().unwrap_or(0);
+            let fo = fan_out_map.get(f.path.as_str()).copied().unwrap_or(0);
+            let total = fi + fo;
+            let inst = if total > 0 { fo as f64 / total as f64 } else { 0.0 };
+            let br = arch.blast_radius.get(&f.path).copied().unwrap_or(0);
+
+            let (max_cc, max_cog) = f.sa.as_ref()
+                .and_then(|sa| sa.functions.as_ref())
+                .map(|funcs| {
+                    let cc = funcs.iter().filter_map(|func| func.cc).max().unwrap_or(1);
+                    let cog = funcs.iter().filter_map(|func| func.cog).max().unwrap_or(0);
+                    (cc, cog)
+                })
+                .unwrap_or((1, 0));
+
+            let churn = churn_map
+                .and_then(|cm| cm.get(&f.path))
+                .map(|c| c.commit_count)
+                .unwrap_or(0);
+
+            // Risk composite: structural reach × complexity × change frequency.
+            // Uses max(blast_radius, coupling) so high-reach files rank even with zero churn.
+            // Churn floor of 1.0 ensures structural-only risk is never zeroed out.
+            let reach = (br as f64).max((fi + fo) as f64);
+            let complexity_factor = max_cc as f64;
+            let churn_factor = (churn as f64).max(1.0);
+            let risk_score = churn_factor * complexity_factor * reach;
+
+            FileRankData {
+                path: f.path.clone(),
+                fan_in: fi,
+                fan_out: fo,
+                max_cc,
+                max_cog,
+                instability: inst,
+                blast_radius: br,
+                churn,
+                lines: f.lines,
+                risk_score,
+            }
+        })
+        .collect();
+
+    // Sort by selected metric (descending = worst first), break ties alphabetically
+    // for deterministic output.
+    let tiebreak = |a: &FileRankData, b: &FileRankData| a.path.cmp(&b.path);
+    match metric {
+        "coupling" => ranked.sort_by(|a, b| (b.fan_in + b.fan_out).cmp(&(a.fan_in + a.fan_out)).then_with(|| tiebreak(a, b))),
+        "fan_in" => ranked.sort_by(|a, b| b.fan_in.cmp(&a.fan_in).then_with(|| tiebreak(a, b))),
+        "fan_out" => ranked.sort_by(|a, b| b.fan_out.cmp(&a.fan_out).then_with(|| tiebreak(a, b))),
+        "complexity" => ranked.sort_by(|a, b| b.max_cc.cmp(&a.max_cc).then_with(|| tiebreak(a, b))),
+        "cognitive" => ranked.sort_by(|a, b| b.max_cog.cmp(&a.max_cog).then_with(|| tiebreak(a, b))),
+        "instability" => ranked.sort_by(|a, b| b.instability.partial_cmp(&a.instability).unwrap_or(std::cmp::Ordering::Equal).then_with(|| tiebreak(a, b))),
+        "blast_radius" => ranked.sort_by(|a, b| b.blast_radius.cmp(&a.blast_radius).then_with(|| tiebreak(a, b))),
+        "churn" => ranked.sort_by(|a, b| b.churn.cmp(&a.churn).then_with(|| tiebreak(a, b))),
+        "risk" | _ => ranked.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| tiebreak(a, b))),
+    }
+
+    ranked.truncate(limit);
+
+    let has_churn = churn_map.is_some();
+
+    let files_json: Vec<Value> = ranked.iter().enumerate().map(|(i, f)| {
+        let mut entry = json!({
+            "rank": i + 1,
+            "path": f.path,
+            "fan_in": f.fan_in,
+            "fan_out": f.fan_out,
+            "coupling": f.fan_in + f.fan_out,
+            "max_cc": f.max_cc,
+            "max_cognitive": f.max_cog,
+            "instability": (f.instability * 10000.0).round() as u32,
+            "blast_radius": f.blast_radius,
+            "lines": f.lines
+        });
+        if has_churn {
+            entry["churn"] = json!(f.churn);
+            entry["risk_score"] = json!((f.risk_score * 100.0).round() as u64);
+        }
+        entry
+    }).collect();
+
+    let mut result = json!({
+        "metric": metric,
+        "total_source_files": all_files.iter().filter(|f| !f.lang.is_empty() && f.lang != "unknown" && !testgap::is_test_file(&f.path)).count(),
+        "showing": ranked.len(),
+        "files": files_json
+    });
+
+    if metric == "risk" && !has_churn {
+        result["note"] = json!("Risk scores use churn=1 (default). Run git_stats first for accurate churn-weighted risk.");
+    }
+    if metric == "churn" && !has_churn {
+        result["note"] = json!("No git history loaded. Run git_stats first to get churn data.");
+    }
+
+    // Cross-reference with health report issues
+    let issues_in_top: usize = ranked.iter().filter(|f| {
+        health.god_files.iter().any(|g| g.path == f.path)
+        || health.hotspot_files.iter().any(|h| h.path == f.path)
+        || health.circular_dep_files.iter().any(|cycle| cycle.contains(&f.path))
+    }).count();
+    result["issues_overlap"] = json!({
+        "files_with_health_issues": issues_in_top,
+        "out_of": ranked.len()
+    });
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  IMPACT ANALYSIS — Transitive change impact for a file
+// ══════════════════════════════════════════════════════════════════
+
+pub fn impact_analysis_def() -> ToolDef {
+    ToolDef {
+        name: "impact_analysis",
+        description: "Transitive change impact for a single file — understand the cascade before refactoring. Returns: all direct and transitive dependents (full fan-in graph), blast radius as % of codebase, bidirectionally coupled files, and change-coupled files from git history. Change coupling data is available when git_stats has been called. Answers: 'if I restructure this file, what else breaks?'",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative file path as shown by scan" }
+            },
+            "required": ["path"]
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_impact_analysis,
+        invalidates_evolution: false,
+    }
+}
+
+fn handle_impact_analysis(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let raw_path = args.get("path").and_then(|p| p.as_str())
+        .ok_or("Missing 'path' argument")?;
+    let path = raw_path.trim().trim_start_matches("./");
+
+    // Verify the file exists in the scan
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+    let node = all_files.iter()
+        .find(|n| n.path == path || n.path.ends_with(&format!("/{path}")))
+        .ok_or_else(|| format!("File '{path}' not found in scan."))?;
+    let path = &node.path;
+
+    // Filter mod-declaration edges and include call_graph edges (consistent
+    // with compute_fan_maps and top_files). Deduplicate via seen set.
+    let mut all_nodes: HashSet<&str> = HashSet::new();
+    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut fwd_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut seen_edges: HashSet<(&str, &str)> = HashSet::new();
+    for edge in snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+    {
+        all_nodes.insert(edge.from_file.as_str());
+        all_nodes.insert(edge.to_file.as_str());
+        if seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            rev_adj.entry(edge.to_file.as_str()).or_default().push(edge.from_file.as_str());
+            fwd_adj.entry(edge.from_file.as_str()).or_default().push(edge.to_file.as_str());
+        }
+    }
+    for edge in &snap.call_graph {
+        all_nodes.insert(edge.from_file.as_str());
+        all_nodes.insert(edge.to_file.as_str());
+        if seen_edges.insert((edge.from_file.as_str(), edge.to_file.as_str())) {
+            rev_adj.entry(edge.to_file.as_str()).or_default().push(edge.from_file.as_str());
+            fwd_adj.entry(edge.from_file.as_str()).or_default().push(edge.to_file.as_str());
+        }
+    }
+
+    let total_files = all_nodes.len();
+
+    // ── 1. Direct dependents (fan-in) and dependencies (fan-out) ──
+    let direct_dependents: Vec<&str> = rev_adj.get(path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]).to_vec();
+    let direct_dependencies: Vec<&str> = fwd_adj.get(path.as_str()).map(|v| v.as_slice()).unwrap_or(&[]).to_vec();
+
+    // ── 2. Transitive dependents via BFS on reverse graph ──
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    visited.insert(path.as_str());
+    queue.push_back(path.as_str());
+
+    let mut depth_map: HashMap<&str, u32> = HashMap::new();
+
+    while let Some(current) = queue.pop_front() {
+        let current_depth = depth_map.get(current).copied().unwrap_or(0);
+        if let Some(dependents) = rev_adj.get(current) {
+            for &dep in dependents {
+                if visited.insert(dep) {
+                    depth_map.insert(dep, current_depth + 1);
+                    queue.push_back(dep);
+                }
+            }
+        }
+    }
+
+    let transitive_count = visited.len() - 1;
+    let blast_pct = if total_files > 0 {
+        (transitive_count as f64 / total_files as f64 * 10000.0).round() as u32
+    } else { 0 };
+
+    let mut transitive_list: Vec<(&str, u32)> = depth_map.iter()
+        .map(|(&file, &depth)| (file, depth))
+        .collect();
+    transitive_list.sort_by(|(a_file, a_d), (b_file, b_d)| a_d.cmp(b_d).then_with(|| a_file.cmp(b_file)));
+
+    // ── 3. Bidirectionally coupled files (import in both directions) ──
+    // Files that both import and are imported by this file — the tightest coupling.
+    let dependent_set: HashSet<&str> = direct_dependents.iter().copied().collect();
+    let dependency_set: HashSet<&str> = direct_dependencies.iter().copied().collect();
+    let mut bidirectional_coupled: Vec<&str> = dependent_set.intersection(&dependency_set).copied().collect();
+    bidirectional_coupled.sort_unstable();
+
+    // ── 4. Change-coupled files from git history ──
+    let change_coupled: Vec<Value> = if let Some(evo) = state.cached_evolution.as_ref() {
+        evo.coupling_pairs.iter()
+            .filter(|cp| cp.file_a == path.as_str() || cp.file_b == path.as_str())
+            .map(|cp| {
+                let other = if cp.file_a == path.as_str() { &cp.file_b } else { &cp.file_a };
+                let is_import_coupled = dependent_set.contains(other.as_str())
+                    || dependency_set.contains(other.as_str());
+                json!({
+                    "file": other,
+                    "co_changes": cp.co_change_count,
+                    "strength": (cp.coupling_strength * 10000.0).round() as u32,
+                    "import_coupled": is_import_coupled
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // ── 5. Severity assessment ──
+    let severity = if blast_pct > 2500 {
+        "critical"
+    } else if blast_pct > 1000 {
+        "high"
+    } else if blast_pct > 500 {
+        "moderate"
+    } else {
+        "low"
+    };
+
+    let mut result = json!({
+        "path": path,
+        "severity": severity,
+        "direct_dependents": {
+            "count": direct_dependents.len(),
+            "files": direct_dependents
+        },
+        "direct_dependencies": {
+            "count": direct_dependencies.len(),
+            "files": direct_dependencies
+        },
+        "transitive_impact": {
+            "total_affected": transitive_count,
+            "blast_radius_pct": blast_pct,
+            "total_graph_files": total_files,
+            "files": transitive_list.iter().take(30).map(|(f, d)| json!({
+                "file": f,
+                "depth": d
+            })).collect::<Vec<_>>()
+        },
+        "bidirectional_coupled": {
+            "count": bidirectional_coupled.len(),
+            "files": bidirectional_coupled
+        },
+        "architecture": {
+            "level": arch.levels.get(path.as_str()),
+            "blast_radius": arch.blast_radius.get(path.as_str()),
+            "max_level": arch.max_level
+        }
+    });
+
+    if !change_coupled.is_empty() {
+        let hidden_deps: Vec<&Value> = change_coupled.iter()
+            .filter(|v| v.get("import_coupled").and_then(|b| b.as_bool()) == Some(false))
+            .collect();
+        result["change_coupling"] = json!({
+            "pairs": change_coupled,
+            "hidden_dependencies": hidden_deps.len()
+        });
+    } else if state.cached_evolution.is_none() {
+        result["change_coupling"] = json!({
+            "note": "Run git_stats first to see change-coupled files (co-change patterns not visible in import graph)"
+        });
+    }
+
+    Ok(result)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  SUGGEST REFACTORING — Actionable structural recommendations
+// ══════════════════════════════════════════════════════════════════
+
+pub fn suggest_refactoring_def() -> ToolDef {
+    ToolDef {
+        name: "suggest_refactoring",
+        description: "Prioritized refactoring action plan — turns health diagnostics into concrete next steps. Suggests: split god files, merge tightly-coupled pairs, extract complex functions, break dependency cycles, resolve architectural inversions. Each suggestion includes affected files and estimated impact. Merge suggestions are available when git_stats has been called. Drill into suggested files with 'file_info' or 'impact_analysis'. Optionally scope to a directory.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "description": "Directory path to scope analysis (e.g. 'src/app'). Omit for whole project."
+                },
+                "limit": { "type": "integer", "description": "Max suggestions to return (default 15)" }
+            }
+        }),
+        min_tier: Tier::Pro,
+        handler: handle_suggest_refactoring,
+        invalidates_evolution: false,
+    }
+}
+
+/// A single refactoring suggestion with priority and estimated impact.
+struct Suggestion {
+    category: &'static str,
+    priority: u32,  // higher = more urgent
+    action: String,
+    reason: String,
+    files: Vec<String>,
+    estimated_impact: String,
+}
+
+fn handle_suggest_refactoring(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+    let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let health = state.cached_health.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+    let arch = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
+
+    let scope = args.get("scope").and_then(|s| s.as_str());
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15).min(50) as usize;
+
+    let in_scope = |path: &str| -> bool {
+        match scope {
+            Some(s) => path.starts_with(s),
+            None => true,
+        }
+    };
+
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    // Filter mod-declaration edges
+    let dep_edges: Vec<ImportEdge> = snap.import_graph.iter()
+        .filter(|e| !crate::metrics::types::is_mod_declaration_edge(e))
+        .cloned()
+        .collect();
+
+    let all_files = snapshot::flatten_files_ref(&snap.root);
+
+    // ── 1. Split god files (high fan-out, many functions) ──
+    for gf in &health.god_files {
+        if !in_scope(&gf.path) { continue; }
+        let node = all_files.iter().find(|n| n.path == gf.path);
+        let func_count = node.and_then(|n| n.sa.as_ref())
+            .and_then(|sa| sa.functions.as_ref())
+            .map(|f| f.len())
+            .unwrap_or(0);
+        let lines = node.map(|n| n.lines).unwrap_or(0);
+
+        let priority = (gf.value as u32).saturating_mul(10).saturating_add(func_count as u32);
+        suggestions.push(Suggestion {
+            category: "split_file",
+            priority,
+            action: format!("Split '{}' into smaller, focused modules", gf.path),
+            reason: format!(
+                "God file: fan-out={}, {} functions, {} lines. High fan-out means this file knows too much — changes here ripple widely.",
+                gf.value, func_count, lines
+            ),
+            files: vec![gf.path.clone()],
+            estimated_impact: format!("Reducing fan-out from {} to ~{} per module", gf.value, gf.value / 3 + 1),
+        });
+    }
+
+    // ── 2. Break dependency cycles ──
+    for cycle in &health.circular_dep_files {
+        if !cycle.iter().any(|f| in_scope(f)) { continue; }
+        let best_break = crate::metrics::whatif::find_best_cycle_break(&dep_edges, cycle);
+        let (action, files) = if let Some((from, to)) = &best_break {
+            (
+                format!("Break cycle by removing dependency {} → {}. Introduce an interface/trait to invert the dependency.", from, to),
+                vec![from.clone(), to.clone()],
+            )
+        } else {
+            (
+                format!("Break {}-file dependency cycle", cycle.len()),
+                cycle.clone(),
+            )
+        };
+
+        suggestions.push(Suggestion {
+            category: "break_cycle",
+            priority: (cycle.len() as u32).saturating_mul(50),
+            action,
+            reason: format!(
+                "Circular dependency involving {} files: {}. Cycles prevent independent testing and deployment.",
+                cycle.len(),
+                cycle.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ),
+            files,
+            estimated_impact: "Eliminates 1 dependency cycle, improving modularity score".to_string(),
+        });
+    }
+
+    // ── 3. Extract complex functions ──
+    let mut suggested_fns: HashSet<(String, String)> = HashSet::new();
+    for fm in health.complex_functions.iter().chain(health.cog_complex_functions.iter()) {
+        if !in_scope(&fm.file) { continue; }
+        // Only suggest extraction for very complex functions
+        if fm.value < 20 { continue; }
+        // Deduplicate: a function may appear in both complex_functions and cog_complex_functions
+        if !suggested_fns.insert((fm.file.clone(), fm.func.clone())) { continue; }
+
+        // Check if the file has mostly clean functions (good candidate for extraction)
+        let file_complex_count = health.complex_functions.iter()
+            .filter(|f| f.file == fm.file)
+            .count();
+        let total_in_file = all_files.iter()
+            .find(|n| n.path == fm.file)
+            .and_then(|n| n.sa.as_ref())
+            .and_then(|sa| sa.functions.as_ref())
+            .map(|f| f.len())
+            .unwrap_or(0);
+
+        if total_in_file > 0 && file_complex_count <= total_in_file / 3 {
+            suggestions.push(Suggestion {
+                category: "extract_function",
+                priority: fm.value.saturating_mul(5),
+                action: format!("Extract/refactor '{}' in '{}'", fm.func, fm.file),
+                reason: format!(
+                    "Complexity {} (threshold: 15). This function is significantly more complex than its siblings — a good candidate for decomposition.",
+                    fm.value
+                ),
+                files: vec![fm.file.clone()],
+                estimated_impact: format!("Reduce complexity from {} to ~{} per extracted piece", fm.value, fm.value / 3 + 1),
+            });
+        }
+    }
+
+    // ── 4. Merge tightly-coupled file pairs (from change coupling) ──
+    if let Some(evo) = state.cached_evolution.as_ref() {
+        for cp in evo.coupling_pairs.iter().take(20) {
+            if !in_scope(&cp.file_a) && !in_scope(&cp.file_b) { continue; }
+            if cp.coupling_strength < 0.5 { continue; }
+
+            // Check if they're also import-coupled
+            let a_imports_b = dep_edges.iter().any(|e| e.from_file == cp.file_a && e.to_file == cp.file_b);
+            let b_imports_a = dep_edges.iter().any(|e| e.from_file == cp.file_b && e.to_file == cp.file_a);
+
+            if a_imports_b || b_imports_a {
+                suggestions.push(Suggestion {
+                    category: "merge_files",
+                    priority: (cp.coupling_strength * 100.0) as u32,
+                    action: format!("Consider merging '{}' and '{}', or extracting shared logic", cp.file_a, cp.file_b),
+                    reason: format!(
+                        "These files change together in {:.0}% of commits ({} co-changes){}.  High change coupling + import coupling suggests they belong together.",
+                        cp.coupling_strength * 100.0,
+                        cp.co_change_count,
+                        if a_imports_b && b_imports_a { " with bidirectional imports" } else { "" }
+                    ),
+                    files: vec![cp.file_a.clone(), cp.file_b.clone()],
+                    estimated_impact: "Reduces logical coupling and simplifies change management".to_string(),
+                });
+            }
+        }
+    }
+
+    // ── 5. Resolve architectural inversions (upward violations) ──
+    let mut violation_counts: HashMap<String, u32> = HashMap::new();
+    for v in &arch.upward_violations {
+        if !in_scope(&v.from_file) { continue; }
+        *violation_counts.entry(v.from_file.clone()).or_default() += 1;
+    }
+    let mut worst_violators: Vec<(String, u32)> = violation_counts.into_iter().collect();
+    worst_violators.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (file, count) in worst_violators.iter().take(5) {
+        if *count < 2 { continue; }
+        let file_level = arch.levels.get(file.as_str()).copied().unwrap_or(0);
+        suggestions.push(Suggestion {
+            category: "fix_inversion",
+            priority: count.saturating_mul(20),
+            action: format!("Resolve {} upward dependency violations in '{}'", count, file),
+            reason: format!(
+                "This file (level {}) imports {} files from higher architecture levels. This creates hidden coupling and makes the dependency graph harder to reason about.",
+                file_level, count
+            ),
+            files: vec![file.clone()],
+            estimated_impact: format!("Eliminates {} architectural inversions", count),
+        });
+    }
+
+    // ── 6. Large files that should be split ──
+    for lf in &health.long_files {
+        if !in_scope(&lf.path) { continue; }
+        // Only suggest for really large files not already flagged as god files
+        if lf.value < 800 { continue; }
+        if health.god_files.iter().any(|g| g.path == lf.path) { continue; }
+
+        suggestions.push(Suggestion {
+            category: "split_file",
+            priority: (lf.value as u32 / 100).saturating_mul(10),
+            action: format!("Split '{}' ({} lines) into smaller modules", lf.path, lf.value),
+            reason: "Large files are harder to navigate, review, and test. Consider splitting by responsibility.".to_string(),
+            files: vec![lf.path.clone()],
+            estimated_impact: format!("Reduce file size from {} to ~{} lines per module", lf.value, lf.value / 3),
+        });
+    }
+
+    // Sort by priority (highest first) and truncate
+    suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+    suggestions.truncate(limit);
+
+    // Build category summary
+    let mut category_counts: HashMap<&str, usize> = HashMap::new();
+    for s in &suggestions {
+        *category_counts.entry(s.category).or_default() += 1;
+    }
+
+    let suggestions_json: Vec<Value> = suggestions.iter().enumerate().map(|(i, s)| {
+        json!({
+            "rank": i + 1,
+            "category": s.category,
+            "action": s.action,
+            "reason": s.reason,
+            "files": s.files,
+            "estimated_impact": s.estimated_impact
+        })
+    }).collect();
+
+    let mut result = json!({
+        "scope": scope.unwrap_or("(whole project)"),
+        "total_suggestions": suggestions_json.len(),
+        "categories": category_counts,
+        "suggestions": suggestions_json
+    });
+
+    if state.cached_evolution.is_none() {
+        result["note"] = json!("Run git_stats first to unlock merge/split suggestions based on change coupling patterns.");
     }
 
     Ok(result)

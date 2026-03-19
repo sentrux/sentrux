@@ -58,7 +58,7 @@ pub(crate) fn is_package_index_for_path(path: &str) -> bool {
 /// Compute per-file fan-out and fan-in counts from import + call edges.
 /// Both represent real dependencies — import is explicit, call is implicit.
 /// Deduplicated: A→B via import AND call counts as 1 edge.
-fn compute_fan_maps(import_edges: &[ImportEdge], call_edges: &[crate::core::types::CallEdge]) -> (HashMap<String, usize>, HashMap<String, usize>) {
+pub fn compute_fan_maps(import_edges: &[ImportEdge], call_edges: &[crate::core::types::CallEdge]) -> (HashMap<String, usize>, HashMap<String, usize>) {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut fan_out: HashMap<String, usize> = HashMap::new();
     let mut fan_in: HashMap<String, usize> = HashMap::new();
