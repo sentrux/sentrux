@@ -59,6 +59,18 @@ fn process_walk_entry(
         return ignore::WalkState::Continue;
     }
     let path = entry.path().to_path_buf();
+    // Reject files inside globally ignored dirs (e.g. node_modules) even when
+    // git-tracked. The walker's filter_entry doesn't reliably prevent descent
+    // into tracked-but-ignored directories in parallel mode.
+    if path.components().any(|c| {
+        if let std::path::Component::Normal(s) = c {
+            s.to_str().is_some_and(|name| should_ignore_dir(name))
+        } else {
+            false
+        }
+    }) {
+        return ignore::WalkState::Continue;
+    }
     if should_ignore_file(&path) {
         return ignore::WalkState::Continue;
     }
@@ -121,6 +133,14 @@ fn collect_paths_git(root: &Path, file_size_limit: u64) -> Option<Vec<CollectedF
         .take(MAX_FILES)
         .filter_map(|rel| {
             let abs = root.join(rel);
+            // Skip files inside globally ignored dirs (e.g. node_modules)
+            // even when git-tracked — some repos commit their dependencies.
+            if std::path::Path::new(rel).components().any(|c| {
+                matches!(c, std::path::Component::Normal(s) if s.to_str().is_some_and(|n| should_ignore_dir(n)))
+            }) {
+                ignored_ext += 1;
+                return None;
+            }
             if should_ignore_file(&abs) {
                 ignored_ext += 1;
                 return None;
@@ -183,6 +203,14 @@ fn collect_paths_walk(root: &Path, file_size_limit: u64) -> Vec<CollectedFile> {
                     return ignore::WalkState::Quit;
                 }
                 if let Ok(entry) = result {
+                    // Skip ignored dirs even when git-tracked (e.g. committed node_modules).
+                    // filter_entry doesn't apply in parallel mode, so check here.
+                    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        let name = entry.file_name().to_string_lossy();
+                        if should_ignore_dir(&name) {
+                            return ignore::WalkState::Skip;
+                        }
+                    }
                     return process_walk_entry(&entry, file_size_limit, &count, &tx);
                 }
                 ignore::WalkState::Continue

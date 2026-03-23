@@ -64,6 +64,11 @@ pub(crate) fn detect_lang(path: &Path) -> String {
 const GLOBAL_IGNORED_DIRS: &[&str] = &[
     ".git", ".DS_Store", ".claude", ".cognitive", ".beemem",
     "lib64", "include",
+    // Common dependency/build dirs — ensures filtering even when plugins
+    // haven't loaded yet (LazyLock initialization race).
+    "node_modules", "vendor", ".next", "dist", "build", "target",
+    "__pycache__", ".pytest_cache", ".venv", "venv",
+    "DerivedData", ".build", ".swiftpm",
 ];
 
 /// Merged ignored dirs: global + all plugins. Cached at first access.
