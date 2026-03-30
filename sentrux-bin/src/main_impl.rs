@@ -71,6 +71,10 @@ enum Command {
         /// Directory to check
         #[arg(default_value = ".")]
         path: String,
+
+        /// Output results as JSON (for CI and AI agent integration)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Structural regression gate — compare against a saved baseline
@@ -82,6 +86,10 @@ enum Command {
         /// Directory to gate
         #[arg(default_value = ".")]
         path: String,
+
+        /// Output results as JSON (for CI and AI agent integration)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Open the GUI with a pre-loaded directory
@@ -199,11 +207,11 @@ pub fn run() -> eframe::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Check { path }) => {
-            std::process::exit(run_check(&path));
+        Some(Command::Check { path, json }) => {
+            std::process::exit(run_check(&path, json));
         }
-        Some(Command::Gate { save, path }) => {
-            std::process::exit(run_gate(&path, save));
+        Some(Command::Gate { save, path, json }) => {
+            std::process::exit(run_gate(&path, save, json));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -422,7 +430,7 @@ fn run_analytics(action: Option<AnalyticsAction>) {
 // ---------------------------------------------------------------------------
 
 /// Run architectural rules check from CLI. Returns exit code.
-fn run_check(path: &str) -> i32 {
+fn run_check(path: &str, json: bool) -> i32 {
     let root = std::path::Path::new(path);
     if !root.is_dir() {
         eprintln!("Error: not a directory: {path}");
@@ -455,14 +463,66 @@ fn run_check(path: &str) -> i32 {
     let arch_report = metrics::arch::compute_arch(&result.snapshot);
     let check = metrics::rules::check_rules(&config, &health, &arch_report, &result.snapshot.import_graph);
 
-    print_check_results(&check, &health, &arch_report)
+    if json {
+        print_check_results_json(&check, &health)
+    } else {
+        print_check_results(&check, &health)
+    }
+}
+
+/// Print check results as JSON for CI and AI agent integration.
+fn print_check_results_json(
+    check: &metrics::rules::RuleCheckResult,
+    health: &metrics::HealthReport,
+) -> i32 {
+    let violations: Vec<serde_json::Value> = check.violations.iter().map(|v| {
+        serde_json::json!({
+            "rule": v.rule,
+            "severity": format!("{:?}", v.severity),
+            "message": v.message,
+            "files": v.files,
+        })
+    }).collect();
+
+    let output = serde_json::json!({
+        "passed": check.passed,
+        "rules_checked": check.rules_checked,
+        "quality": (health.quality_signal * 10000.0).round() as u32,
+        "violations": violations,
+        "metrics": {
+            "coupling_score": health.coupling_score,
+            "cycle_count": health.circular_dep_count,
+            "cycles": health.circular_dep_files,
+            "cycle_paths": health.circular_dep_paths,
+            "god_file_count": health.god_files.len(),
+            "god_files": health.god_files.iter().map(|g| {
+                serde_json::json!({
+                    "file": g.path,
+                    "fan_out": g.value,
+                })
+            }).collect::<Vec<_>>(),
+            "complex_functions": health.complex_functions.iter().map(|f| {
+                serde_json::json!({
+                    "file": f.file,
+                    "function": f.func,
+                    "complexity": f.value,
+                })
+            }).collect::<Vec<_>>(),
+            "max_depth": health.max_depth,
+            "total_import_edges": health.total_import_edges,
+            "cross_module_edges": health.cross_module_edges,
+        },
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+
+    if check.passed { 0 } else { 1 }
 }
 
 /// Print check results and return exit code (0 = pass, 1 = violations).
 fn print_check_results(
     check: &metrics::rules::RuleCheckResult,
     health: &metrics::HealthReport,
-    arch_report: &metrics::arch::ArchReport,
 ) -> i32 {
     println!("sentrux check — {} rules checked\n", check.rules_checked);
     println!("Quality: {}\n",
@@ -482,6 +542,14 @@ fn print_check_results(
                 println!("    {f}");
             }
         }
+        // Print cycle paths if available
+        if !health.circular_dep_paths.is_empty() {
+            println!("\nCycle paths:");
+            for (i, path) in health.circular_dep_paths.iter().enumerate() {
+                let path_str = path.join(" → ");
+                println!("  {}: {}", i + 1, path_str);
+            }
+        }
         println!("\n✗ {} violation(s) found", check.violations.len());
         1
     }
@@ -492,7 +560,7 @@ fn print_check_results(
 // ---------------------------------------------------------------------------
 
 /// Run structural regression gate from CLI. Returns exit code.
-fn run_gate(path: &str, save_mode: bool) -> i32 {
+fn run_gate(path: &str, save_mode: bool, json: bool) -> i32 {
     let root = std::path::Path::new(path);
     if !root.is_dir() {
         eprintln!("Error: not a directory: {path}");
@@ -519,6 +587,8 @@ fn run_gate(path: &str, save_mode: bool) -> i32 {
 
     if save_mode {
         gate_save(&baseline_path, &health, &arch_report)
+    } else if json {
+        gate_compare_json(&baseline_path, &health)
     } else {
         gate_compare(&baseline_path, &health, &arch_report)
     }
@@ -549,6 +619,39 @@ fn gate_save(
             1
         }
     }
+}
+
+fn gate_compare_json(
+    baseline_path: &std::path::Path,
+    health: &metrics::HealthReport,
+) -> i32 {
+    let baseline = match metrics::arch::ArchBaseline::load(baseline_path) {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({"error": format!("Failed to load baseline: {e}")});
+            println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            return 1;
+        }
+    };
+
+    let diff = baseline.diff(health);
+
+    let output = serde_json::json!({
+        "degraded": diff.degraded,
+        "quality_before": (diff.signal_before * 10000.0).round() as u32,
+        "quality_after": (diff.signal_after * 10000.0).round() as u32,
+        "coupling_before": diff.coupling_before,
+        "coupling_after": diff.coupling_after,
+        "cycles_before": diff.cycles_before,
+        "cycles_after": diff.cycles_after,
+        "god_files_before": diff.god_files_before,
+        "god_files_after": diff.god_files_after,
+        "violations": diff.violations,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+
+    if diff.degraded { 1 } else { 0 }
 }
 
 fn gate_compare(

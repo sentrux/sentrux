@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 eframe = { workspace = true }
 egui = { workspace = true }
 dirs = "6"
+serde_json = "1"
 
 [features]
 default = []

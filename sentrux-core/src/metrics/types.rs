@@ -24,6 +24,8 @@ pub struct HealthReport {
     pub circular_dep_count: usize,
     /// Files involved in each circular dependency cycle
     pub circular_dep_files: Vec<Vec<String>>,
+    /// Shortest cycle path for each SCC (e.g. ["A", "B", "C", "A"])
+    pub circular_dep_paths: Vec<Vec<String>>,
     /// Total import edges in the dependency graph
     pub total_import_edges: usize,
     /// Import edges that cross module boundaries
@@ -195,6 +197,7 @@ pub(crate) struct ModuleMetrics {
     pub(crate) avg_cohesion: Option<f64>,
     pub(crate) max_depth: u32,
     pub(crate) circular_dep_files: Vec<Vec<String>>,
+    pub(crate) circular_dep_paths: Vec<Vec<String>>,
     pub(crate) circular_dep_count: usize,
 }
 
