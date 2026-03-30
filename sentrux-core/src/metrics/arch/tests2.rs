@@ -27,6 +27,7 @@ fn baseline_stable_no_degradation() {
         coupling_score: 0.28,
         circular_dep_count: 1,
         circular_dep_files: vec![],
+        circular_dep_paths: vec![],
         total_import_edges: 15,
         cross_module_edges: 4,
         entropy: 0.3,

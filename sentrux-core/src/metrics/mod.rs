@@ -548,11 +548,12 @@ fn compute_module_metrics(
     let avg_cohesion = compute_avg_cohesion(dep_edges, call_edges, files);
     let max_depth = compute_max_depth(dep_edges, entry_points);
     let circular_dep_files = detect_cycles(dep_edges);
+    let circular_dep_paths = extract_cycle_paths(&circular_dep_files, dep_edges);
     let circular_dep_count = circular_dep_files.len();
 
     ModuleMetrics {
         coupling_score, cross_module_edges, entropy, entropy_bits, entropy_num_pairs,
-        avg_cohesion, max_depth, circular_dep_files, circular_dep_count,
+        avg_cohesion, max_depth, circular_dep_files, circular_dep_paths, circular_dep_count,
     }
 }
 
@@ -599,6 +600,7 @@ pub fn compute_health(snapshot: &Snapshot) -> HealthReport {
         coupling_score: mm.coupling_score,
         circular_dep_count: mm.circular_dep_count,
         circular_dep_files: mm.circular_dep_files,
+        circular_dep_paths: mm.circular_dep_paths,
         total_import_edges: dep_edges.len(),
         cross_module_edges: mm.cross_module_edges,
         entropy: mm.entropy,
@@ -766,6 +768,75 @@ fn tarjan_sccs<'a>(
 fn detect_cycles(edges: &[ImportEdge]) -> Vec<Vec<String>> {
     let (nodes, adj) = build_adjacency_list(edges);
     tarjan_sccs(&nodes, &adj)
+}
+
+/// Extract one concrete cycle path from each SCC using DFS within the subgraph.
+/// For each SCC, finds a path like ["A", "B", "C", "A"] showing the actual dependency chain.
+fn extract_cycle_paths(sccs: &[Vec<String>], edges: &[ImportEdge]) -> Vec<Vec<String>> {
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges {
+        adj.entry(edge.from_file.as_str())
+            .or_default()
+            .push(edge.to_file.as_str());
+    }
+
+    let mut paths = Vec::new();
+    for scc in sccs {
+        if scc.len() < 2 {
+            continue;
+        }
+        let scc_set: HashSet<&str> = scc.iter().map(|s| s.as_str()).collect();
+        if let Some(path) = find_cycle_in_subgraph(&scc_set, &adj) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// DFS within an SCC subgraph to find one concrete cycle, returned as
+/// [start, ..., start] so the caller can see the full loop.
+fn find_cycle_in_subgraph(
+    scc: &HashSet<&str>,
+    adj: &HashMap<&str, Vec<&str>>,
+) -> Option<Vec<String>> {
+    // Pick an arbitrary start node
+    let &start = scc.iter().next()?;
+
+    // DFS with parent tracking
+    let mut stack: Vec<&str> = vec![start];
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut parent: HashMap<&str, &str> = HashMap::new();
+    visited.insert(start);
+
+    while let Some(node) = stack.pop() {
+        let neighbors = adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
+        for &next in neighbors {
+            if !scc.contains(next) {
+                continue; // Stay within the SCC
+            }
+            if next == start && visited.len() > 1 {
+                // Found a cycle back to start — reconstruct path
+                // Build chain: node → parent[node] → ... → start
+                let mut chain = Vec::new();
+                let mut cur = node;
+                while cur != start {
+                    chain.push(cur.to_string());
+                    cur = parent[cur];
+                }
+                chain.push(start.to_string());
+                chain.reverse();
+                // chain = [start, ..., node], append start to close the loop
+                chain.push(start.to_string());
+                return Some(chain);
+            }
+            if !visited.contains(next) {
+                visited.insert(next);
+                parent.insert(next, node);
+                stack.push(next);
+            }
+        }
+    }
+    None
 }
 
 /// Seed nodes for depth: entry points, or root nodes (fan-in = 0).

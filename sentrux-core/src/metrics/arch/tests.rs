@@ -175,6 +175,7 @@ fn baseline_detects_degradation() {
         coupling_score: 0.45,
         circular_dep_count: 2,
         circular_dep_files: vec![vec!["a.rs".into(), "b.rs".into()]],
+        circular_dep_paths: vec![vec!["a.rs".into(), "b.rs".into(), "a.rs".into()]],
         total_import_edges: 20,
         cross_module_edges: 9,
         entropy: 0.5,
