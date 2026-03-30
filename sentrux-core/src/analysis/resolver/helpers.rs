@@ -90,6 +90,12 @@ pub(super) fn try_suffix_resolve(
                 return Some(result);
             }
         }
+        // Module prefixes are configured (e.g., Go with go.mod) but this
+        // specifier doesn't match any → it's an external dependency (stdlib
+        // or third-party). Don't fall through to progressive suffix stripping,
+        // which would create false edges (e.g., "encoding/json" → "json" →
+        // matches library/json/).
+        return None;
     }
 
     try_suffix_resolve_inner(specifier, env, file_dir_str, file_dir)

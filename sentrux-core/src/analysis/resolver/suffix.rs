@@ -1097,4 +1097,103 @@ mod tests {
         assert_eq!(split_json_path("compilerOptions.paths"), vec!["compilerOptions", "paths"]);
         assert_eq!(split_json_path("name"), vec!["name"]);
     }
+
+    // ── Helper: build a minimal SuffixIndex + ResolveEnv for resolver tests ──
+
+    use crate::analysis::resolver::helpers::{
+        SuffixIndex, ResolveEnv, try_suffix_resolve,
+    };
+
+    fn make_suffix_index<'a>(
+        files: &[&'a str],
+        module_prefixes: Vec<(String, String)>,
+        dir_pkg_exts: &[&str],
+    ) -> SuffixIndex<'a> {
+        let mut index = HashMap::new();
+        for &file_path in files {
+            let module_path = crate::analysis::resolver::helpers::file_to_module_path(file_path);
+            if module_path.is_empty() { continue; }
+            add_module_suffixes(&mut index, module_path, file_path);
+            if !dir_pkg_exts.is_empty() {
+                let has_ext = file_path.rsplit('.').next()
+                    .map_or(false, |ext| dir_pkg_exts.iter().any(|e| *e == ext));
+                if has_ext {
+                    if let Some((parent, _)) = module_path.rsplit_once('/') {
+                        if !parent.is_empty() {
+                            add_module_suffixes(&mut index, parent, file_path);
+                        }
+                    }
+                }
+            }
+        }
+        SuffixIndex { index, manifest_name_aliases: HashMap::new(), module_prefixes }
+    }
+
+    // ── Resolver: stdlib imports should NOT match project files when module prefixes exist ──
+
+    #[test]
+    fn stdlib_import_not_resolved_with_module_prefix() {
+        let files: Vec<&str> = vec![
+            "library/json/json.go",
+            "library/json/decode.go",
+            "library/log/log.go",
+            "app/handler/handler.go",
+        ];
+        let known: HashSet<&str> = files.iter().copied().collect();
+        let module_prefixes = vec![
+            ("gitlab.example.com/org/repo".to_string(), String::new()),
+        ];
+        let suffix_index = make_suffix_index(&files, module_prefixes, &["go"]);
+        let env = ResolveEnv {
+            suffix_index: &suffix_index,
+            known_files: &known,
+            exts: &["go"],
+            directory_is_package: true,
+        };
+        assert_eq!(try_suffix_resolve("encoding/json", &env, "app/handler", Path::new("app/handler")), None);
+        assert_eq!(try_suffix_resolve("net/http", &env, "app/handler", Path::new("app/handler")), None);
+        assert_eq!(try_suffix_resolve("path/filepath", &env, "app/handler", Path::new("app/handler")), None);
+    }
+
+    #[test]
+    fn project_import_resolves_with_module_prefix() {
+        let files: Vec<&str> = vec![
+            "library/json/json.go",
+            "library/log/log.go",
+            "app/handler/handler.go",
+        ];
+        let known: HashSet<&str> = files.iter().copied().collect();
+        let module_prefixes = vec![
+            ("gitlab.example.com/org/repo".to_string(), String::new()),
+        ];
+        let suffix_index = make_suffix_index(&files, module_prefixes, &["go"]);
+        let env = ResolveEnv {
+            suffix_index: &suffix_index,
+            known_files: &known,
+            exts: &["go"],
+            directory_is_package: true,
+        };
+        let result = try_suffix_resolve(
+            "gitlab.example.com/org/repo/library/json", &env,
+            "app/handler", Path::new("app/handler"),
+        );
+        assert!(result.is_some(), "project-internal import should resolve");
+        assert!(result.unwrap().starts_with("library/json/"),
+            "should resolve to a file in library/json/");
+    }
+
+    #[test]
+    fn no_module_prefix_still_uses_suffix_stripping() {
+        let files: Vec<&str> = vec!["src/utils/json.py"];
+        let known: HashSet<&str> = files.iter().copied().collect();
+        let suffix_index = make_suffix_index(&files, vec![], &[]);
+        let env = ResolveEnv {
+            suffix_index: &suffix_index,
+            known_files: &known,
+            exts: &["py"],
+            directory_is_package: false,
+        };
+        let result = try_suffix_resolve("utils/json", &env, "src/app", Path::new("src/app"));
+        assert!(result.is_some(), "without module prefixes, suffix stripping should work");
+    }
 }
