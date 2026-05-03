@@ -81,7 +81,8 @@ pub struct LayerDef {
     pub name: String,
     /// Glob patterns matching files in this layer (e.g., "src/ui/*").
     pub paths: Vec<String>,
-    /// Layer order (lower = more foundational). Layers can only depend downward.
+    /// Layer order (lower = more foundational like core/infrastructure, higher = higher layer like app/presentation).
+    /// Dependencies flow upward: foundational layers can be imported by higher layers, but not vice versa.
     /// If not specified, order is determined by position in the array.
     pub order: Option<u32>,
 }
@@ -187,12 +188,13 @@ pub fn check_rules(
     RuleCheckResult { passed, violations, rules_checked }
 }
 
-/// Check layer ordering: files in higher layers must not import files in lower layers.
-/// Layers are ordered by their `order` field or array position (first = highest/presentation, last = lowest/infrastructure).
+/// Check layer ordering: files in lower layers (more foundational) must not import files in higher layers.
+/// Layers are ordered by their `order` field: lower order = more foundational (core/infrastructure), higher order = higher layer (app/presentation).
+/// Dependencies must flow upward: foundational layers can be imported by higher layers, but not vice versa.
 fn check_layers(layers: &[LayerDef], edges: &[ImportEdge]) -> Vec<RuleViolation> {
     let mut violations = Vec::new();
 
-    // Assign order to each layer (lower order = more foundational = can be depended on)
+    // Assign order to each layer (lower order = more foundational, higher order = higher layer)
     let layer_order: Vec<(usize, &LayerDef)> = layers
         .iter()
         .enumerate()
@@ -208,10 +210,10 @@ fn check_layers(layers: &[LayerDef], edges: &[ImportEdge]) -> Vec<RuleViolation>
         let to_layer = find_layer(&edge.to_file, &layer_order);
 
         if let (Some((from_ord, from_name)), Some((to_ord, to_name))) = (from_layer, to_layer) {
-            // Violation: importing from a higher-order (less foundational) layer
-            // Lower order = more foundational. A file in order=2 importing order=0 is wrong
-            // (infrastructure importing presentation).
-            if from_ord > to_ord {
+            // Violation: a foundational layer (lower order) imports a higher layer (higher order)
+            // Lower order = more foundational. A file in order=0 importing order=2 is wrong
+            // (core layer must not depend on app layer).
+            if from_ord < to_ord {
                 violations.push(RuleViolation {
                     rule: "layer_direction".into(),
                     severity: Severity::Error,

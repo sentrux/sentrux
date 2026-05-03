@@ -66,8 +66,8 @@ no_god_files = true
 max_upward_violations = 0
 
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*", "src/renderer/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs", "src/watcher.rs", "src/git.rs"]
 order = 0
 
 [[layers]]
@@ -76,8 +76,8 @@ paths = ["src/metrics.rs", "src/graph.rs", "src/arch.rs"]
 order = 1
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs", "src/watcher.rs", "src/git.rs"]
+name = "presentation"
+paths = ["src/ui/*", "src/renderer/*"]
 order = 2
 
 [[boundaries]]
@@ -89,7 +89,7 @@ reason = "Renderer must not know about scanning"
         assert!((config.constraints.min_quality.unwrap() - 0.4).abs() < 0.01);
         assert!((config.constraints.max_coupling_score.unwrap() - 0.35).abs() < 0.01);
         assert_eq!(config.layers.len(), 3);
-        assert_eq!(config.layers[0].name, "presentation");
+        assert_eq!(config.layers[0].name, "infrastructure");
         assert_eq!(config.boundaries.len(), 1);
         assert_eq!(config.boundaries[0].reason, "Renderer must not know about scanning");
     }
@@ -170,17 +170,17 @@ max_cycles = 5
     fn layer_violation_detected() {
         let config: RulesConfig = toml::from_str(r#"
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs"]
 order = 0
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs"]
+name = "presentation"
+paths = ["src/ui/*"]
 order = 2
 "#).unwrap();
 
-        // Infrastructure imports presentation = violation
+        // Infrastructure (foundational, order=0) imports presentation (higher layer, order=2) = violation
         let edges = vec![edge("src/scanner.rs", "src/ui/panel.rs")];
         let snap = make_snapshot(edges.clone(), vec![
             file("src/scanner.rs"),
@@ -198,17 +198,17 @@ order = 2
     fn layer_correct_direction_passes() {
         let config: RulesConfig = toml::from_str(r#"
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs"]
 order = 0
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs"]
+name = "presentation"
+paths = ["src/ui/*"]
 order = 2
 "#).unwrap();
 
-        // Presentation imports infrastructure = correct direction
+        // Presentation (higher layer, order=2) imports infrastructure (foundational, order=0) = correct direction
         let edges = vec![edge("src/ui/panel.rs", "src/scanner.rs")];
         let snap = make_snapshot(edges.clone(), vec![
             file("src/ui/panel.rs"),
