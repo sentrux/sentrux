@@ -62,7 +62,7 @@ pub(crate) fn detect_lang(path: &Path) -> String {
 /// Global ignored dirs (OS/tool artifacts, not language-specific).
 /// Language-specific ignored dirs come from plugin.toml [semantics.project].
 const GLOBAL_IGNORED_DIRS: &[&str] = &[
-    ".git", ".DS_Store", ".claude", ".cognitive", ".beemem",
+    ".git", ".jj", ".DS_Store", ".claude", ".cognitive", ".beemem",
     "lib64", "include",
 ];
 
