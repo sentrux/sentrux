@@ -18,7 +18,7 @@ use crate::core::snapshot::{ScanProgress, Snapshot};
 use crate::core::types::FileNode;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +29,13 @@ use std::time::UNIX_EPOCH;
 struct CollectedFile {
     path: PathBuf,
     mtime: f64,
+}
+
+/// Optional scan behavior for callers that need to widen the default project file set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanOptions {
+    /// Include untracked, non-ignored Git worktree files in addition to tracked files.
+    pub include_untracked: bool,
 }
 
 /// Extract mtime as f64 seconds since UNIX_EPOCH from file metadata.
@@ -83,11 +90,11 @@ fn process_walk_entry(
 /// First-principles reasoning: the user's git index is the single source of truth for
 /// what constitutes "their code." It handles .gitignore, monorepos, workspaces, and
 /// any project structure without heuristics or hardcoded ignore lists.
-fn collect_paths(root: &Path, file_size_limit: u64) -> Vec<CollectedFile> {
+fn collect_paths(root: &Path, file_size_limit: u64, options: ScanOptions) -> Vec<CollectedFile> {
     // Try git ls-files first — the universal correct approach
-    if let Some(files) = collect_paths_git(root, file_size_limit) {
+    if let Some(files) = collect_paths_git(root, file_size_limit, options) {
         if !files.is_empty() {
-            crate::debug_log!("[scan] using git ls-files ({} tracked files)", files.len());
+            crate::debug_log!("[scan] using git ls-files ({} files)", files.len());
             return files;
         }
     }
@@ -99,25 +106,33 @@ fn collect_paths(root: &Path, file_size_limit: u64) -> Vec<CollectedFile> {
 /// Collect files via `git ls-files` — returns None if not a git repo or git fails.
 /// This is the primary path: git already knows every tracked file, respects .gitignore,
 /// handles monorepos/workspaces, and requires zero heuristic filtering.
-fn collect_paths_git(root: &Path, file_size_limit: u64) -> Option<Vec<CollectedFile>> {
-    let output = std::process::Command::new("git")
-        .args(["ls-files", "-z"])  // null-delimited for safe path handling
-        .current_dir(root)
-        .output()
-        .ok()?;
+fn collect_paths_git(
+    root: &Path,
+    file_size_limit: u64,
+    options: ScanOptions,
+) -> Option<Vec<CollectedFile>> {
+    let tracked = git_ls_files(root, &["ls-files", "-z"])?;
+    let untracked = if options.include_untracked {
+        git_ls_files(root, &["ls-files", "-z", "--others", "--exclude-standard"])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    if !output.status.success() {
-        return None; // not a git repo or git not available
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let total_git = stdout.split('\0').filter(|s| !s.is_empty()).count();
+    let total_tracked = tracked.len();
+    let total_untracked = untracked.len();
+    let mut seen = HashSet::new();
+    let entries: Vec<String> = tracked
+        .into_iter()
+        .chain(untracked)
+        .filter(|rel| seen.insert(rel.clone()))
+        .collect();
+    let total_git = entries.len();
     let mut ignored_ext = 0u32;
     let mut meta_fail = 0u32;
     let mut too_big = 0u32;
-    let files: Vec<CollectedFile> = stdout
-        .split('\0')
-        .filter(|s| !s.is_empty())
+    let files: Vec<CollectedFile> = entries
+        .iter()
         .take(MAX_FILES)
         .filter_map(|rel| {
             let abs = root.join(rel);
@@ -139,13 +154,32 @@ fn collect_paths_git(root: &Path, file_size_limit: u64) -> Option<Vec<CollectedF
         .collect();
 
     let dropped = total_git - files.len();
-    if dropped > 0 {
+    if dropped > 0 || options.include_untracked {
         eprintln!(
-            "[scan] git ls-files: {} total, {} kept, {} dropped (ext:{}, meta:{}, big:{})",
-            total_git, files.len(), dropped, ignored_ext, meta_fail, too_big
+            "[scan] git ls-files: {} total ({} tracked, {} untracked), {} kept, {} dropped (ext:{}, meta:{}, big:{})",
+            total_git, total_tracked, total_untracked, files.len(), dropped, ignored_ext, meta_fail, too_big
         );
     }
     Some(files)
+}
+
+fn git_ls_files(root: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None; // not a git repo or git not available
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Fallback: filesystem walk for non-git directories.
@@ -259,12 +293,13 @@ fn walk_and_scan_files(
     root: &Path,
     max_file_size: u64,
     max_parse_size_kb: usize,
+    options: ScanOptions,
     scan_t0: std::time::Instant,
     emit: &dyn Fn(&str, u8),
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Vec<FileNode> {
     emit("Collecting files\u{2026}", 5);
-    let collected = collect_paths(root, max_file_size * 1024);
+    let collected = collect_paths(root, max_file_size * 1024, options);
     let total_files = collected.len();
     crate::debug_log!("[scan] collect_paths: {:.1}ms ({} files)", scan_t0.elapsed().as_secs_f64() * 1000.0, total_files);
 
@@ -375,6 +410,25 @@ pub fn scan_directory(
     limits: &ScanLimits,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ScanResult, AppError> {
+    scan_directory_with_options(
+        root_path,
+        on_progress,
+        on_tree_ready,
+        limits,
+        cancel,
+        ScanOptions::default(),
+    )
+}
+
+/// Main scan function with caller-selected scan options.
+pub fn scan_directory_with_options(
+    root_path: &str,
+    on_progress: Option<&dyn Fn(ScanProgress)>,
+    on_tree_ready: Option<&dyn Fn(Snapshot)>,
+    limits: &ScanLimits,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    options: ScanOptions,
+) -> Result<ScanResult, AppError> {
     let scan_t0 = std::time::Instant::now();
     let root = Path::new(root_path);
     if !root.exists() || !root.is_dir() {
@@ -390,7 +444,7 @@ pub fn scan_directory(
     // Single pass: collect + scan + parse per file (no tokei, no separate parse phase)
     let mut files = walk_and_scan_files(
         root, limits.max_file_size_kb, limits.max_parse_size_kb,
-        scan_t0, &emit, cancel,
+        options, scan_t0, &emit, cancel,
     );
 
     // Check cancel
@@ -406,6 +460,65 @@ pub fn scan_directory(
         root, max_call_targets: limits.max_call_targets, scan_t0, emit: &emit, on_tree_ready,
     };
     Ok(build_tree_and_graphs(files, &bctx))
+}
+
+#[cfg(test)]
+mod scan_options_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn include_untracked_adds_git_worktree_files() {
+        let root = std::env::temp_dir().join(format!(
+            "sentrux-include-untracked-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let result = (|| {
+            run_git(&root, &["init"]);
+            fs::write(root.join("tracked.rs"), "pub fn tracked() {}\n").unwrap();
+            run_git(&root, &["add", "tracked.rs"]);
+            fs::write(root.join("new_file.rs"), "pub fn new_file() {}\n").unwrap();
+
+            let limits = ScanLimits {
+                max_file_size_kb: 2048,
+                max_parse_size_kb: 512,
+                max_call_targets: 5,
+            };
+            let root_str = root.to_str().unwrap();
+            let tracked_only = scan_directory(root_str, None, None, &limits, None).unwrap();
+            let with_untracked = scan_directory_with_options(
+                root_str,
+                None,
+                None,
+                &limits,
+                None,
+                ScanOptions { include_untracked: true },
+            ).unwrap();
+
+            assert_eq!(tracked_only.snapshot.total_files, 1);
+            assert_eq!(with_untracked.snapshot.total_files, 2);
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Re-export for backward compatibility.
