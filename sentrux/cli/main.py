@@ -1,6 +1,7 @@
 """CLI interface for Sentrux."""
 
 import json
+import sys
 from pathlib import Path
 
 import click
@@ -192,7 +193,11 @@ def _print_analysis_summary(analysis, verbose: int = 0) -> None:
 
 def main():
     """Entry point for the CLI."""
-    cli()
+    if "--mcp" in sys.argv:
+        from sentrux.mcp.server import run_mcp_server
+        run_mcp_server()
+    else:
+        cli()
 
 
 if __name__ == "__main__":
