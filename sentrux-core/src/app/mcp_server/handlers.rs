@@ -19,10 +19,13 @@ use std::sync::Arc;
 
 // ── Scan helper (shared by scan, rescan, session_end) ──
 
-pub(crate) fn do_scan(root: &Path) -> Result<(Snapshot, metrics::HealthReport, arch::ArchReport), String> {
+pub(crate) fn do_scan_with_options(
+    root: &Path,
+    options: scanner::ScanOptions,
+) -> Result<(Snapshot, metrics::HealthReport, arch::ArchReport), String> {
     let root_str = root.to_str().ok_or("Invalid path encoding")?;
     let s = crate::core::settings::Settings::default();
-    let result = scanner::scan_directory(
+    let result = scanner::scan_directory_with_options(
         root_str,
         None,
         None,
@@ -32,6 +35,7 @@ pub(crate) fn do_scan(root: &Path) -> Result<(Snapshot, metrics::HealthReport, a
             max_call_targets: s.max_call_targets,
         },
         None, // MCP scans are not cancellable
+        options,
     ).map_err(|e| format!("Scan failed: {e}"))?;
     let arch_report = arch::compute_arch(&result.snapshot);
     let health = metrics::compute_health(&result.snapshot);
@@ -50,7 +54,12 @@ pub fn scan_def() -> ToolDef {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Absolute path to the directory to scan" }
+                "path": { "type": "string", "description": "Absolute path to the directory to scan" },
+                "include_untracked": {
+                    "type": "boolean",
+                    "description": "Include untracked, non-ignored Git worktree files in the scan",
+                    "default": false
+                }
             },
             "required": ["path"]
         }),
@@ -69,10 +78,18 @@ fn handle_scan(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value
         return Err(format!("Not a directory: {path}"));
     }
 
-    let (snapshot, health, arch_report) = do_scan(&root)?;
+    let include_untracked = args.get("include_untracked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let (snapshot, health, arch_report) = do_scan_with_options(
+        &root,
+        scanner::ScanOptions { include_untracked },
+    )?;
 
     let result = json!({
         "scanned": path,
+        "include_untracked": include_untracked,
         "quality_signal": (health.quality_signal * 10000.0).round() as u32,
         "files": snapshot.total_files,
         "lines": snapshot.total_lines,
@@ -208,23 +225,39 @@ pub fn session_end_def() -> ToolDef {
     ToolDef {
         name: "session_end",
         description: "Re-scan and compare current state against session baseline. Returns diff showing what degraded.",
-        input_schema: json!({ "type": "object", "properties": {} }),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "include_untracked": {
+                    "type": "boolean",
+                    "description": "Include untracked, non-ignored Git worktree files in the scan",
+                    "default": false
+                }
+            }
+        }),
         min_tier: Tier::Free,
         handler: handle_session_end,
         invalidates_evolution: true,
     }
 }
 
-fn handle_session_end(_args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+fn handle_session_end(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
     // Clone to avoid borrow conflict: we read root+baseline, then mutate state.
     let root = state.scan_root.clone().ok_or("No scan root. Call 'scan' first.")?;
     let baseline = state.baseline.clone().ok_or("No baseline saved. Call 'session_start' first.")?;
 
-    let (snapshot, health, arch_report) = do_scan(&root)?;
+    let include_untracked = args.get("include_untracked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (snapshot, health, arch_report) = do_scan_with_options(
+        &root,
+        scanner::ScanOptions { include_untracked },
+    )?;
     let diff = baseline.diff(&health);
 
     let result = json!({
         "pass": !diff.degraded,
+        "include_untracked": include_untracked,
         "signal_before": (diff.signal_before * 10000.0).round() as i32,
         "signal_after": (diff.signal_after * 10000.0).round() as i32,
         "signal_delta": ((diff.signal_after - diff.signal_before) * 10000.0).round() as i32,
@@ -249,20 +282,36 @@ pub fn rescan_def() -> ToolDef {
     ToolDef {
         name: "rescan",
         description: "Re-scan the current directory to pick up file changes since last scan.",
-        input_schema: json!({ "type": "object", "properties": {} }),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "include_untracked": {
+                    "type": "boolean",
+                    "description": "Include untracked, non-ignored Git worktree files in the scan",
+                    "default": false
+                }
+            }
+        }),
         min_tier: Tier::Free,
         handler: handle_rescan,
         invalidates_evolution: true,
     }
 }
 
-fn handle_rescan(_args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
+fn handle_rescan(args: &Value, _tier: &Tier, state: &mut McpState) -> Result<Value, String> {
     // Clone root to avoid borrow conflict
     let root = state.scan_root.clone().ok_or("No scan root. Call 'scan' first.")?;
-    let (snapshot, health, arch_report) = do_scan(&root)?;
+    let include_untracked = args.get("include_untracked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (snapshot, health, arch_report) = do_scan_with_options(
+        &root,
+        scanner::ScanOptions { include_untracked },
+    )?;
 
     let result = json!({
         "status": "Rescanned",
+        "include_untracked": include_untracked,
         "quality_signal": (health.quality_signal * 10000.0).round() as u32,
         "files": snapshot.total_files
     });

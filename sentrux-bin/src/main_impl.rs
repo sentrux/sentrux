@@ -71,6 +71,10 @@ enum Command {
         /// Directory to check
         #[arg(default_value = ".")]
         path: String,
+
+        /// Include untracked, non-ignored Git worktree files in the scan
+        #[arg(long)]
+        include_untracked: bool,
     },
 
     /// Structural regression gate — compare against a saved baseline
@@ -199,8 +203,8 @@ pub fn run() -> eframe::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Check { path }) => {
-            std::process::exit(run_check(&path));
+        Some(Command::Check { path, include_untracked }) => {
+            std::process::exit(run_check(&path, include_untracked));
         }
         Some(Command::Gate { save, path }) => {
             std::process::exit(run_gate(&path, save));
@@ -422,7 +426,7 @@ fn run_analytics(action: Option<AnalyticsAction>) {
 // ---------------------------------------------------------------------------
 
 /// Run architectural rules check from CLI. Returns exit code.
-fn run_check(path: &str) -> i32 {
+fn run_check(path: &str, include_untracked: bool) -> i32 {
     let root = std::path::Path::new(path);
     if !root.is_dir() {
         eprintln!("Error: not a directory: {path}");
@@ -438,11 +442,16 @@ fn run_check(path: &str) -> i32 {
         }
     };
 
-    eprintln!("Scanning {path}...");
-    let result = match analysis::scanner::scan_directory(
+    if include_untracked {
+        eprintln!("Scanning {path} including untracked files...");
+    } else {
+        eprintln!("Scanning {path}...");
+    }
+    let result = match analysis::scanner::scan_directory_with_options(
         path, None, None,
         &cli_scan_limits(),
         None,
+        analysis::scanner::ScanOptions { include_untracked },
     ) {
         Ok(r) => r,
         Err(e) => {
