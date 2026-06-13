@@ -113,6 +113,36 @@ pub struct ArchReport {
     //  — proxy metrics, all captured by root cause modularity Q)
 }
 
+/// One complex function entry stored in a baseline for gate/session diffs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComplexFnSnapshot {
+    pub file: String,
+    pub func: String,
+    pub cc: u32,
+}
+
+impl ComplexFnSnapshot {
+    fn from_func_metric(m: &crate::metrics::FuncMetric) -> Self {
+        Self {
+            file: m.file.clone(),
+            func: m.func.clone(),
+            cc: m.value,
+        }
+    }
+
+    fn key(&self) -> String {
+        format!("{}::{}", self.file, self.func)
+    }
+}
+
+fn complex_fn_snapshots(report: &crate::metrics::HealthReport) -> Vec<ComplexFnSnapshot> {
+    report
+        .complex_functions
+        .iter()
+        .map(ComplexFnSnapshot::from_func_metric)
+        .collect()
+}
+
 /// Baseline snapshot for session diff / structural regression gate.
 /// Captured at session start; subsequent scans compare against this
 /// to detect regressions (e.g., quality_signal drop, new cycles).
@@ -138,6 +168,9 @@ pub struct ArchBaseline {
     pub total_import_edges: usize,
     /// Cross-module import edges at baseline
     pub cross_module_edges: usize,
+    /// Complex functions (CC > language threshold) at baseline — optional for backward compat.
+    #[serde(default)]
+    pub complex_functions: Vec<ComplexFnSnapshot>,
 }
 
 /// Diff between two snapshots (baseline vs current).
@@ -163,6 +196,10 @@ pub struct ArchDiff {
     pub degraded: bool,
     /// Human-readable violation descriptions
     pub violations: Vec<String>,
+    /// Complex functions present in current scan but not in baseline
+    pub new_complex_functions: Vec<ComplexFnSnapshot>,
+    /// Complex functions present in baseline but no longer complex in current scan
+    pub removed_complex_functions: Vec<ComplexFnSnapshot>,
 }
 
 // ── Baseline Save/Load ──
@@ -184,6 +221,7 @@ impl ArchBaseline {
             max_depth: report.max_depth,
             total_import_edges: report.total_import_edges,
             cross_module_edges: report.cross_module_edges,
+            complex_functions: complex_fn_snapshots(report),
         }
     }
 
@@ -237,12 +275,28 @@ impl ArchBaseline {
                 current.god_files.len()
             ));
         }
+        let current_complex = complex_fn_snapshots(current);
+        let legacy_baseline = self.complex_functions.is_empty() && self.complex_fn_count > 0;
+        let (new_complex_functions, removed_complex_functions) = if legacy_baseline {
+            (Vec::new(), Vec::new())
+        } else {
+            diff_complex_functions(&self.complex_functions, &current_complex)
+        };
+
         if current.complex_functions.len() > self.complex_fn_count {
             violations.push(format!(
                 "Complex functions increased: {} → {}",
                 self.complex_fn_count,
                 current.complex_functions.len()
             ));
+        }
+        if !legacy_baseline {
+            for f in &new_complex_functions {
+                violations.push(format!(
+                    "New complex function: {}::{} (cc={})",
+                    f.file, f.func, f.cc
+                ));
+            }
         }
 
         let degraded = current.quality_signal < self.quality_signal - 0.02
@@ -259,8 +313,33 @@ impl ArchBaseline {
             god_files_after: current.god_files.len(),
             degraded,
             violations,
+            new_complex_functions,
+            removed_complex_functions,
         }
     }
+}
+
+/// Set-diff complex function snapshots by `file::func` key.
+fn diff_complex_functions(
+    before: &[ComplexFnSnapshot],
+    after: &[ComplexFnSnapshot],
+) -> (Vec<ComplexFnSnapshot>, Vec<ComplexFnSnapshot>) {
+    use std::collections::HashSet;
+
+    let before_keys: HashSet<String> = before.iter().map(ComplexFnSnapshot::key).collect();
+    let after_keys: HashSet<String> = after.iter().map(ComplexFnSnapshot::key).collect();
+
+    let new_fns: Vec<ComplexFnSnapshot> = after
+        .iter()
+        .filter(|f| !before_keys.contains(&f.key()))
+        .cloned()
+        .collect();
+    let removed_fns: Vec<ComplexFnSnapshot> = before
+        .iter()
+        .filter(|f| !after_keys.contains(&f.key()))
+        .cloned()
+        .collect();
+    (new_fns, removed_fns)
 }
 
 // ── Grading ──

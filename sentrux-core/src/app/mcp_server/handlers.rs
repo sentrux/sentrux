@@ -231,6 +231,16 @@ fn handle_session_end(_args: &Value, _tier: &Tier, state: &mut McpState) -> Resu
         "coupling_change": [diff.coupling_before, diff.coupling_after],
         "cycles_change": [diff.cycles_before, diff.cycles_after],
         "violations": diff.violations,
+        "new_complex_functions": diff.new_complex_functions.iter().map(|f| json!({
+            "file": f.file,
+            "func": f.func,
+            "cc": f.cc,
+        })).collect::<Vec<_>>(),
+        "removed_complex_functions": diff.removed_complex_functions.iter().map(|f| json!({
+            "file": f.file,
+            "func": f.func,
+            "cc": f.cc,
+        })).collect::<Vec<_>>(),
         "summary": if diff.degraded { "Quality degraded" } else { "Quality stable or improved" }
     });
 

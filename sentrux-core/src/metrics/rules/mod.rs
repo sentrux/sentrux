@@ -52,6 +52,22 @@ pub struct RulesConfig {
     /// Explicit deny rules between file patterns.
     #[serde(default)]
     pub boundaries: Vec<BoundaryRule>,
+
+    /// Known false-positive import edges to suppress (suffix resolver noise).
+    #[serde(default)]
+    pub exceptions: Vec<ExceptionRule>,
+}
+
+/// Suppress a layer/boundary violation for a specific import edge.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExceptionRule {
+    /// Glob pattern for source files.
+    pub from: String,
+    /// Glob pattern for target files.
+    pub to: String,
+    /// Human-readable reason (documented in rules.toml header).
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Per-language section in rules.toml.
@@ -174,13 +190,13 @@ pub fn check_rules(
     // ── Layer checks ──
     if config.layers.len() >= 2 {
         rules_checked += 1;
-        violations.extend(check_layers(&config.layers, edges));
+        violations.extend(check_layers(&config.layers, &config.exceptions, edges));
     }
 
     // ── Boundary checks ──
     for boundary in &config.boundaries {
         rules_checked += 1;
-        violations.extend(check_boundary(boundary, edges));
+        violations.extend(check_boundary(boundary, &config.exceptions, edges));
     }
 
     let passed = violations.iter().all(|v| v.severity != Severity::Error);
@@ -189,7 +205,17 @@ pub fn check_rules(
 
 /// Check layer ordering: files in higher layers must not import files in lower layers.
 /// Layers are ordered by their `order` field or array position (first = highest/presentation, last = lowest/infrastructure).
-fn check_layers(layers: &[LayerDef], edges: &[ImportEdge]) -> Vec<RuleViolation> {
+fn is_exception(exceptions: &[ExceptionRule], from: &str, to: &str) -> bool {
+    exceptions
+        .iter()
+        .any(|e| glob_match(&e.from, from) && glob_match(&e.to, to))
+}
+
+fn check_layers(
+    layers: &[LayerDef],
+    exceptions: &[ExceptionRule],
+    edges: &[ImportEdge],
+) -> Vec<RuleViolation> {
     let mut violations = Vec::new();
 
     // Assign order to each layer (lower order = more foundational = can be depended on)
@@ -211,7 +237,7 @@ fn check_layers(layers: &[LayerDef], edges: &[ImportEdge]) -> Vec<RuleViolation>
             // Violation: importing from a higher-order (less foundational) layer
             // Lower order = more foundational. A file in order=2 importing order=0 is wrong
             // (infrastructure importing presentation).
-            if from_ord > to_ord {
+            if from_ord > to_ord && !is_exception(exceptions, &edge.from_file, &edge.to_file) {
                 violations.push(RuleViolation {
                     rule: "layer_direction".into(),
                     severity: Severity::Error,
@@ -287,11 +313,18 @@ pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 /// Check a single boundary rule against all edges.
-fn check_boundary(rule: &BoundaryRule, edges: &[ImportEdge]) -> Vec<RuleViolation> {
+fn check_boundary(
+    rule: &BoundaryRule,
+    exceptions: &[ExceptionRule],
+    edges: &[ImportEdge],
+) -> Vec<RuleViolation> {
     let mut violations = Vec::new();
 
     for edge in edges {
-        if glob_match(&rule.from, &edge.from_file) && glob_match(&rule.to, &edge.to_file) {
+        if glob_match(&rule.from, &edge.from_file)
+            && glob_match(&rule.to, &edge.to_file)
+            && !is_exception(exceptions, &edge.from_file, &edge.to_file)
+        {
             violations.push(RuleViolation {
                 rule: "boundary".into(),
                 severity: Severity::Error,

@@ -169,6 +169,7 @@ fn baseline_detects_degradation() {
         max_depth: 3,
         total_import_edges: 10,
         cross_module_edges: 1,
+        complex_functions: vec![],
     };
 
     let current = crate::metrics::HealthReport {
@@ -228,4 +229,113 @@ fn baseline_detects_degradation() {
     assert!(diff.violations.iter().any(|v| v.contains("Cycles")));
     assert!(diff.violations.iter().any(|v| v.contains("God files")));
     assert!(diff.violations.iter().any(|v| v.contains("Complex functions")));
+}
+
+#[test]
+fn baseline_diff_names_new_complex_functions() {
+    let baseline = ArchBaseline {
+        timestamp: 0.0,
+        quality_signal: 0.90,
+        coupling_score: 0.10,
+        cycle_count: 0,
+        god_file_count: 0,
+        hotspot_count: 0,
+        complex_fn_count: 2,
+        max_depth: 3,
+        total_import_edges: 10,
+        cross_module_edges: 1,
+        complex_functions: vec![
+            ComplexFnSnapshot {
+                file: "a.rs".into(),
+                func: "keep".into(),
+                cc: 16,
+            },
+            ComplexFnSnapshot {
+                file: "b.rs".into(),
+                func: "gone".into(),
+                cc: 17,
+            },
+        ],
+    };
+
+    let current = crate::metrics::HealthReport {
+        coupling_score: 0.10,
+        circular_dep_count: 0,
+        circular_dep_files: vec![],
+        total_import_edges: 10,
+        cross_module_edges: 1,
+        entropy: 0.5,
+        entropy_bits: 1.5,
+        avg_cohesion: Some(0.3),
+        max_depth: 3,
+        god_files: vec![],
+        hotspot_files: vec![],
+        most_unstable: vec![],
+        complex_functions: vec![
+            crate::metrics::FuncMetric {
+                file: "a.rs".into(),
+                func: "keep".into(),
+                value: 16,
+            },
+            crate::metrics::FuncMetric {
+                file: "c.rs".into(),
+                func: "new_one".into(),
+                value: 18,
+            },
+            crate::metrics::FuncMetric {
+                file: "d.rs".into(),
+                func: "new_two".into(),
+                value: 20,
+            },
+        ],
+        long_functions: vec![],
+        cog_complex_functions: vec![],
+        high_param_functions: vec![],
+        duplicate_groups: vec![],
+        dead_functions: vec![],
+        long_files: vec![],
+        all_function_ccs: vec![],
+        all_function_lines: vec![],
+        all_file_lines: vec![],
+        god_file_ratio: 0.0,
+        hotspot_ratio: 0.0,
+        complex_fn_ratio: 0.08,
+        long_fn_ratio: 0.0,
+        comment_ratio: Some(0.1),
+        large_file_count: 0,
+        large_file_ratio: 0.0,
+        duplication_ratio: 0.0,
+        dead_code_ratio: 0.0,
+        high_param_ratio: 0.0,
+        cog_complex_ratio: 0.0,
+        quality_signal: 0.90,
+        root_cause_raw: crate::metrics::root_causes::RootCauseRaw {
+            modularity_q: 0.3,
+            cycle_count: 0,
+            max_depth: 3,
+            complexity_gini: 0.3,
+            redundancy_ratio: 0.1,
+        },
+        root_cause_scores: crate::metrics::root_causes::RootCauseScores {
+            modularity: 0.53,
+            acyclicity: 0.33,
+            depth: 0.62,
+            equality: 0.7,
+            redundancy: 0.9,
+        },
+    };
+
+    let diff = baseline.diff(&current);
+    assert!(diff.degraded);
+    assert_eq!(diff.new_complex_functions.len(), 2);
+    assert!(diff
+        .new_complex_functions
+        .iter()
+        .any(|f| f.file == "c.rs" && f.func == "new_one"));
+    assert!(diff
+        .new_complex_functions
+        .iter()
+        .any(|f| f.file == "d.rs" && f.func == "new_two"));
+    assert_eq!(diff.removed_complex_functions.len(), 1);
+    assert!(diff.violations.iter().any(|v| v.contains("new_one")));
 }
