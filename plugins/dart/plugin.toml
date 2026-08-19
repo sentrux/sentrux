@@ -1,7 +1,7 @@
 [plugin]
 name = "dart"
 display_name = "Dart"
-version = "0.2.0"
+version = "0.2.1"
 extensions = ["dart"]
 min_sentrux_version = "0.4.0"
 color_rgb = [100, 180, 220]
