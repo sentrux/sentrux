@@ -293,7 +293,20 @@ fn check_boundary(rule: &BoundaryRule, edges: &[ImportEdge]) -> Vec<RuleViolatio
     let mut violations = Vec::new();
 
     for edge in edges {
-        if glob_match(&rule.from, &edge.from_file) && glob_match(&rule.to, &edge.to_file) {
+        // m_from: the rule's `from` glob matches this edge's importer — the file that
+        // contains the import statement (the dependent side).
+        // m_to: the rule's `to` glob matches this edge's imported file — the dependency
+        // target. The two checks are independent; a violation requires BOTH on the same edge.
+        let m_from = glob_match(&rule.from, &edge.from_file);
+        let m_to = glob_match(&rule.to, &edge.to_file);
+        // Three possible outcomes per edge (false/false is trivially allowed):
+        //   (true, false) — importer is in the restricted group, but the target is not the
+        //     forbidden group (e.g. renderer imports core). Not the forbidden pattern: allowed.
+        //   (false, true) — target is in the forbidden group, but the importer is not the
+        //     restricted source (e.g. metrics imports analysis). Allowed.
+        //   (true, true)  — an actual "from-group file imports to-group file" dependency
+        //     exists: exactly what this deny rule forbids → violation.
+        if m_from && m_to {
             violations.push(RuleViolation {
                 rule: "boundary".into(),
                 severity: Severity::Error,
