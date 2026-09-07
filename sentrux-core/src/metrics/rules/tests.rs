@@ -66,8 +66,8 @@ no_god_files = true
 max_upward_violations = 0
 
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*", "src/renderer/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs", "src/watcher.rs", "src/git.rs"]
 order = 0
 
 [[layers]]
@@ -76,8 +76,8 @@ paths = ["src/metrics.rs", "src/graph.rs", "src/arch.rs"]
 order = 1
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs", "src/watcher.rs", "src/git.rs"]
+name = "presentation"
+paths = ["src/ui/*", "src/renderer/*"]
 order = 2
 
 [[boundaries]]
@@ -89,7 +89,7 @@ reason = "Renderer must not know about scanning"
         assert!((config.constraints.min_quality.unwrap() - 0.4).abs() < 0.01);
         assert!((config.constraints.max_coupling_score.unwrap() - 0.35).abs() < 0.01);
         assert_eq!(config.layers.len(), 3);
-        assert_eq!(config.layers[0].name, "presentation");
+        assert_eq!(config.layers[0].name, "infrastructure");
         assert_eq!(config.boundaries.len(), 1);
         assert_eq!(config.boundaries[0].reason, "Renderer must not know about scanning");
     }
@@ -127,6 +127,16 @@ reason = "Renderer must not know about scanning"
         assert!(glob_match("*.rs", "src/app.rs"));
         assert!(glob_match("*.rs", "deep/nested/file.rs"));
         assert!(!glob_match("*.rs", "src/app.ts"));
+    }
+
+    #[test]
+    fn glob_has_no_middle_wildcard_support() {
+        // `*`/`**` only work as a trailing segment. Patterns are matched verbatim
+        // against scan-root-relative paths, so crate-prefixed workspace paths
+        // ("sentrux-core/src/...") need the prefix spelled out in the pattern.
+        assert!(!glob_match("*/src/renderer/*", "sentrux-core/src/renderer/x.rs"));
+        assert!(!glob_match("src/renderer/*", "sentrux-core/src/renderer/x.rs"));
+        assert!(glob_match("sentrux-core/src/renderer/*", "sentrux-core/src/renderer/x.rs"));
     }
 
     // ── Constraint checks ──
@@ -170,17 +180,17 @@ max_cycles = 5
     fn layer_violation_detected() {
         let config: RulesConfig = toml::from_str(r#"
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs"]
 order = 0
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs"]
+name = "presentation"
+paths = ["src/ui/*"]
 order = 2
 "#).unwrap();
 
-        // Infrastructure imports presentation = violation
+        // Infrastructure (foundational, order=0) imports presentation (higher layer, order=2) = violation
         let edges = vec![edge("src/scanner.rs", "src/ui/panel.rs")];
         let snap = make_snapshot(edges.clone(), vec![
             file("src/scanner.rs"),
@@ -198,17 +208,17 @@ order = 2
     fn layer_correct_direction_passes() {
         let config: RulesConfig = toml::from_str(r#"
 [[layers]]
-name = "presentation"
-paths = ["src/ui/*"]
+name = "infrastructure"
+paths = ["src/scanner.rs"]
 order = 0
 
 [[layers]]
-name = "infrastructure"
-paths = ["src/scanner.rs"]
+name = "presentation"
+paths = ["src/ui/*"]
 order = 2
 "#).unwrap();
 
-        // Presentation imports infrastructure = correct direction
+        // Presentation (higher layer, order=2) imports infrastructure (foundational, order=0) = correct direction
         let edges = vec![edge("src/ui/panel.rs", "src/scanner.rs")];
         let snap = make_snapshot(edges.clone(), vec![
             file("src/ui/panel.rs"),
@@ -272,6 +282,192 @@ to = "src/scanner.rs"
             .filter(|v| v.rule == "boundary")
             .collect();
         assert!(boundary_violations.is_empty());
+    }
+
+    // ── Boundary scenarios (from the _dbg_fixture experiment) ──
+    //
+    // Mirrors `.sentrux/rules.toml`: 6 layers (lower order = more foundational,
+    // dependencies must flow from higher to lower) plus the two deny boundaries.
+    // These cases pin down how boundary checks differ from the layer order check.
+
+    fn fixture_style_config() -> RulesConfig {
+        toml::from_str(r#"
+[[layers]]
+name = "core"
+paths = ["src/core/*"]
+order = 0
+
+[[layers]]
+name = "analysis"
+paths = ["src/analysis/*"]
+order = 1
+
+[[layers]]
+name = "metrics"
+paths = ["src/metrics/*"]
+order = 2
+
+[[layers]]
+name = "layout"
+paths = ["src/layout/*"]
+order = 3
+
+[[layers]]
+name = "renderer"
+paths = ["src/renderer/*"]
+order = 4
+
+[[layers]]
+name = "app"
+paths = ["src/app/*"]
+order = 5
+
+[[boundaries]]
+from = "src/renderer/*"
+to = "src/analysis/*"
+reason = "Renderer must not depend on analysis directly"
+
+[[boundaries]]
+from = "src/layout/*"
+to = "src/app/*"
+reason = "Layout must not depend on app layer"
+"#).unwrap()
+    }
+
+    #[test]
+    fn boundary_fires_even_when_layer_direction_is_legal() {
+        // renderer (order=4) imports analysis (order=1): higher -> lower is the LEGAL
+        // layer direction, so no layer_direction violation. The deny boundary is
+        // order-agnostic and still fires — this is the fixture group 1 scenario.
+        let config = fixture_style_config();
+        let edges = vec![edge("src/renderer/edges.rs", "src/analysis/graph.rs")];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("src/renderer/edges.rs"),
+            file("src/analysis/graph.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        assert!(!result.passed);
+        assert!(result.violations.iter().any(|v|
+            v.rule == "boundary" && v.message.contains("Renderer must not depend on analysis")
+        ));
+        assert!(result.violations.iter().all(|v| v.rule != "layer_direction"),
+            "higher -> lower is the legal layer direction, must not fire");
+    }
+
+    #[test]
+    fn boundary_and_layer_check_fire_together_for_wrong_direction() {
+        // layout (order=3) imports app (order=5): lower -> higher is the forbidden
+        // layer direction AND matches the layout -> app deny boundary, so BOTH rules
+        // fire — this is the fixture group 2 scenario.
+        let config = fixture_style_config();
+        let edges = vec![edge("src/layout/types.rs", "src/app/state.rs")];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("src/layout/types.rs"),
+            file("src/app/state.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        assert!(!result.passed);
+        assert!(result.violations.iter().any(|v| v.rule == "layer_direction"));
+        assert!(result.violations.iter().any(|v|
+            v.rule == "boundary" && v.message.contains("Layout must not depend on app")
+        ));
+    }
+
+    #[test]
+    fn boundary_from_match_only_is_allowed() {
+        // (m_from=true, m_to=false): renderer imports core. The importer is in the
+        // restricted group but the target is not the forbidden group; the layer
+        // direction is also legal (4 -> 0). Everything passes.
+        let config = fixture_style_config();
+        let edges = vec![edge("src/renderer/colors.rs", "src/core/types.rs")];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("src/renderer/colors.rs"),
+            file("src/core/types.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        assert!(result.passed);
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn boundary_is_directional_reverse_edge_does_not_fire() {
+        // analysis (order=1) imports renderer (order=4): the reverse of the deny
+        // rule. Boundaries only forbid the from -> to direction, so neither boundary
+        // fires; the wrong-direction edge is caught by the layer check instead.
+        let config = fixture_style_config();
+        let edges = vec![edge("src/analysis/graph.rs", "src/renderer/edges.rs")];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("src/analysis/graph.rs"),
+            file("src/renderer/edges.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        let boundary_violations: Vec<_> = result.violations.iter()
+            .filter(|v| v.rule == "boundary")
+            .collect();
+        assert!(boundary_violations.is_empty());
+        assert!(result.violations.iter().any(|v| v.rule == "layer_direction"),
+            "lower -> higher layer import must be caught by the layer check");
+    }
+
+    #[test]
+    fn boundary_patterns_match_scan_root_relative_paths_only() {
+        // Regression for the silent-pass root cause: when scanning a workspace root,
+        // edge paths carry the crate prefix ("sentrux-core/src/..."). glob_match has
+        // no middle-wildcard support, so "src/renderer/*" patterns match nothing and
+        // the boundary check silently passes. Patterns must spell out the prefix.
+        let config = fixture_style_config();
+        let edges = vec![edge(
+            "sentrux-core/src/renderer/colors.rs",
+            "sentrux-core/src/analysis/lang_registry.rs",
+        )];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("sentrux-core/src/renderer/colors.rs"),
+            file("sentrux-core/src/analysis/lang_registry.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        assert!(result.passed, "crate-prefixed paths never match the src/* patterns");
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn boundary_reports_one_violation_per_matching_edge() {
+        // Unlike layer_direction (deduplicated by message), check_boundary pushes
+        // one violation per matching edge — two importing files produce two reports.
+        let config = fixture_style_config();
+        let edges = vec![
+            edge("src/renderer/edges.rs", "src/analysis/graph.rs"),
+            edge("src/renderer/colors.rs", "src/analysis/lang_registry.rs"),
+        ];
+        let snap = make_snapshot(edges.clone(), vec![
+            file("src/renderer/edges.rs"),
+            file("src/renderer/colors.rs"),
+            file("src/analysis/graph.rs"),
+            file("src/analysis/lang_registry.rs"),
+        ]);
+        let health = metrics::compute_health(&snap);
+        let arch_report = arch::compute_arch(&snap);
+
+        let result = check_rules(&config, &health, &arch_report, &edges);
+        assert!(!result.passed);
+        let boundary_violations: Vec<_> = result.violations.iter()
+            .filter(|v| v.rule == "boundary")
+            .collect();
+        assert_eq!(boundary_violations.len(), 2);
     }
 
     // ── Empty rules pass everything ──
